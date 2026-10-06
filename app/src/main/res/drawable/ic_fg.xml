@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Talaria: a single winged stroke -->
+    <group android:translateX="-4">
+        <path android:strokeColor="#F0C46C" android:strokeWidth="6.5" android:strokeLineCap="round" android:pathData="M37,70 C45,52 60,40 80,35"/>
+        <path android:strokeColor="#F0C46C" android:strokeWidth="6.5" android:strokeLineCap="round" android:pathData="M37,70 C48,60 61,53 76,50"/>
+        <path android:strokeColor="#F0C46C" android:strokeWidth="6.5" android:strokeLineCap="round" android:pathData="M37,70 C48,67 59,65 70,65"/>
+        <path android:fillColor="#F0C46C" android:pathData="M37,65a5,5 0 1,1 0,10a5,5 0 1,1 0,-10z"/>
+    </group>
+</vector>
