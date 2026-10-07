@@ -139,7 +139,11 @@ class Gateway(private val api: Api, private val store: Store) {
     @Volatile var runtimeSid: String = ""; private set
     /** A chat started on this phone keeps its Talaria label when compression moves it onto a new id. */
     @Volatile var storedSid: String = ""
-        private set(v) { if (v.isNotBlank() && v != field && field.isNotBlank() && store.isMine(field)) store.markMine(v); field = v }
+        private set(v) {
+            if (v.isNotBlank() && v != field && field.isNotBlank() && store.isMine(field)) store.markMine(v)
+            field = v
+            if (v.isNotBlank()) runCatching { store.lastChat = v }
+        }
     private var seq = 0L
     private var userSeen = 0
     private fun k(p: String) = "$p-${seq++}"
@@ -206,6 +210,7 @@ class Gateway(private val api: Api, private val store: Store) {
 
     /** Bumped for every socket; callbacks from an older socket are ignored so a late close can't kill a newer link. */
     @Volatile private var connGen = 0
+    @Volatile private var everOpened = false
     private var watchdog: Job? = null
 
     private inner class Listener(private val gen: Int) : WebSocketListener() {
@@ -213,7 +218,8 @@ class Gateway(private val api: Api, private val store: Store) {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (stale(webSocket)) { webSocket.close(1000, "superseded"); return }
             ws = webSocket
-            val wasReconnect = reconnecting.value || attempt > 0
+            val wasReconnect = reconnecting.value || attempt > 0 || everOpened
+            everOpened = true
             conn.value = Conn.Ready
             connError.value = null
             attempt = 0
@@ -222,8 +228,14 @@ class Gateway(private val api: Api, private val store: Store) {
             scope.launch {
                 runCatching { rpc("client.capabilities", jsonOf("server_requests" to true)) }
                 // re-attach to the chat we were in so streaming and history pick up where they left off
-                if (wasReconnect && storedSid.isNotBlank()) runCatching {
-                    applySnapshot(resumeRpc(storedSid))
+                if (wasReconnect && storedSid.isNotBlank() && !loadingSession.value) runCatching {
+                    val keep = storedSid
+                    val r = resumeRpc(keep)
+                    if (storedSid == keep) applySnapshot(r)
+                } else if (!wasReconnect && storedSid.isBlank() && items.value.isEmpty()) {
+                    // cold start (process was killed while away): reopen the chat you were in, not a blank one
+                    val last = store.lastChat
+                    if (last.isNotBlank()) runCatching { resume(last, store.lastChatTitle.ifBlank { null }) }
                 }
                 reconnecting.value = false
             }
@@ -349,14 +361,20 @@ class Gateway(private val api: Api, private val store: Store) {
                 val ids = pl.a("request_ids").strs().toSet()
                 asks.update { l -> l.filterNot { it.method == "approval" && ((it.id as? JsonPrimitive)?.content in ids || it.params.s("request_id") in ids) } }
             }
-            "session.reclaimed" -> if (mine(sid)) {
-                // the server dropped our live session (e.g. idle while backgrounded); pick the chat back up
-                val stored = pl.sn("stored_session_id") ?: storedSid
-                if (stored.isNotBlank()) scope.launch { runCatching { storedSid = stored; applySnapshot(resumeRpc(stored)) } }
+            "session.reclaimed" -> {
+                // Global broadcast: the frame's session_id is always "", so match on the payload. Every client hears
+                // every reap (other chats idling out, other devices), and only OUR runtime/chat may trigger a resume.
+                val dead = pl.s("session_id")
+                val stored = pl.s("stored_session_id")
+                val ours = (dead.isNotBlank() && dead == runtimeSid) || (dead.isBlank() && stored.isNotBlank() && stored == storedSid)
+                if (ours && storedSid.isNotBlank()) {
+                    val keep = storedSid
+                    scope.launch { runCatching { if (storedSid == keep) applySnapshot(resumeRpc(keep)) } }
+                }
             }
             "request.cancel" -> { val id = pl.s("id"); asks.update { l -> l.filterNot { (it.id as? JsonPrimitive)?.content == id } } }
             "skin.changed" -> {}
-            else -> if (mine(sid)) onSessionEvent(type, pl)
+            else -> if (mine(sid)) onSessionEvent(type, pl, sid.isNotBlank())
         }
     }
 
@@ -385,7 +403,7 @@ class Gateway(private val api: Api, private val store: Store) {
 
     private fun mutate(i: Int, f: (ChatItem) -> ChatItem) = items.update { l -> l.toMutableList().also { if (i in it.indices) it[i] = f(it[i]) } }
 
-    private fun onSessionEvent(type: String, pl: JsonObject) {
+    private fun onSessionEvent(type: String, pl: JsonObject, targeted: Boolean = true) {
         // any sign of life from a running turn means it's still running (keeps Stop available across multi-step turns)
         if (type in LIVE_EVENTS && !busy.value) {
             // a turn whose message.start we missed: open a fresh turn so its stats don't absorb the previous one's
@@ -443,8 +461,8 @@ class Gateway(private val api: Api, private val store: Store) {
             }
             "message.reaction" -> applyReactions(pl.l("row_id"), parseReactions(pl["reactions"]), pl.s("role"))
             "session.usage" -> usage.value = pl.o("usage")
-            "session.title" -> title.value = pl.s("title").ifBlank { title.value }
-            "session.info" -> { applyInfo(pl) }
+            "session.title" -> { title.value = pl.s("title").ifBlank { title.value }; runCatching { store.lastChatTitle = title.value } }
+            "session.info" -> { applyInfo(pl, allowMove = targeted) }
             "message.complete" -> {
                 val text = pl["text"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: ""
                 val i = lastStreaming()
@@ -723,13 +741,13 @@ class Gateway(private val api: Api, private val store: Store) {
     }.getOrDefault(v)
 
     /** model / yolo / speed from session.info or a snapshot's info. */
-    private fun applyInfo(pl: JsonObject) {
+    private fun applyInfo(pl: JsonObject, allowMove: Boolean = true) {
         pl.sn("model")?.let { if (it.isNotBlank()) model.value = it }
         pl["yolo"]?.let { yolo.value = pl.b("yolo") }
         fastFromInfo(pl)?.let { fast.value = it }
         if (pl.b("running") && busy.value) serverTime(pl["turn_started_at"])?.let { if (turnStart == 0L || it < turnStart) turnStart = it }
         // compression moves the chat onto a new stored id mid-session
-        pl.sn("stored_session_id")?.takeIf { it.isNotBlank() }?.let { storedSid = it }
+        if (allowMove) pl.sn("stored_session_id")?.takeIf { it.isNotBlank() }?.let { storedSid = it }
         // cumulative counters for the live agent: the real baseline for per-turn token stats
         pl.o("usage")?.let { usage.value = it }
         // the server's word that the turn is over, sent even when a muted turn emitted no message.complete
@@ -836,6 +854,7 @@ class Gateway(private val api: Api, private val store: Store) {
         try {
             items.value = emptyList(); title.value = "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
             val p = store.profile.value
+            runCatching { store.lastChatTitle = "" }
             fastAssertFor = ""
             // the speed rides on create itself; a config.set before the agent is built would be dropped
             // one key per new chat, so a retry after a lost reply can't mint a second session
@@ -853,6 +872,7 @@ class Gateway(private val api: Api, private val store: Store) {
         loadingSession.value = true
         try {
             items.value = emptyList(); title.value = t?.ifBlank { null } ?: "Chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
+            runCatching { store.lastChatTitle = t.orEmpty() }
             storedSid = stored
             applySnapshot(resumeRpc(stored))
             runCatching { loadRunSettings() }

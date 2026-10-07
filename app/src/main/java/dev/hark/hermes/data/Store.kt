@@ -201,6 +201,14 @@ class Store(context: Context) {
         val next = (mineSessions.value + id).let { if (it.size > 3000) it.drop(it.size - 3000).toSet() else it }
         prefs.edit().putStringSet("mine_sessions", next).apply(); mineSessions.value = next
     }
+    /** The chat open when the app last went away, per server + profile, so a cold start comes back to it. */
+    var lastChat: String
+        get() = prefs.getString("last_chat:" + _activeId.value + ":" + _profile.value, "") ?: ""
+        set(v) { prefs.edit().putString("last_chat:" + _activeId.value + ":" + _profile.value, v).apply() }
+    var lastChatTitle: String
+        get() = prefs.getString("last_chat_t:" + _activeId.value + ":" + _profile.value, "") ?: ""
+        set(v) { prefs.edit().putString("last_chat_t:" + _activeId.value + ":" + _profile.value, v).apply() }
+
     var askedNotif: Boolean
         get() = prefs.getBoolean("asked_notif", false)
         set(v) { prefs.edit().putBoolean("asked_notif", v).apply() }

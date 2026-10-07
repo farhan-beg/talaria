@@ -3,6 +3,17 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.10] - 2026-10-07 (versionCode 27)
+
+### Fixed
+- Chat switched when returning to the app: `session.reclaimed` is a global server broadcast whose frame `session_id` is always empty, and the app treated empty as "mine", so any chat idling out (another chat, another device) could replace the open chat. It now matches the payload ids against the current chat only.
+- Events without a session id can no longer move the current chat (stored-id changes only from targeted events).
+- Coming back with a dead socket now re-attaches to the same chat (a reset retry counter used to skip the resume).
+- Late resume results are dropped if you opened a different chat meanwhile.
+
+### Added
+- The open chat is remembered per server + profile, so a cold start reopens it instead of a blank chat.
+
 ## [1.14.9] - 2026-10-07 (versionCode 26)
 
 - Composer: live markdown styling (markers dimmed, offsets 1:1), format bar while typing (bold, italic, strikethrough, inline code, code block, heading, bullets, numbers, checklist, quote, link) with toggle-off on re-tap, and a rendered preview. Slash commands stay plain.

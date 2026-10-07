@@ -13,8 +13,8 @@ android {
         applicationId = "dev.hark.hermes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 26
-        versionName = "1.14.9"
+        versionCode = 27
+        versionName = "1.14.10"
     }
     signingConfigs {
         create("release") {
