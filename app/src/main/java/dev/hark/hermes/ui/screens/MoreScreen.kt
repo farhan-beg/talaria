@@ -30,6 +30,7 @@ private val groups = listOf(
         Dest("profiles", "Profiles", "Isolated Hermes instances", Icons.Outlined.People, 0xFF2E7DD7),
         Dest("memory", "Memory", "Providers and built-in stores", Icons.Outlined.Psychology, 0xFFC2410C),
         Dest("files", "Files", "Browse, preview, upload, download", Icons.Outlined.FolderOpen, 0xFFCA8A04),
+        Dest("voice", "Voice", "Phone or Hermes voice, provider, speed", Icons.Outlined.RecordVoiceOver, 0xFF0D9488),
     ),
     "Insights" to listOf(
         Dest("analytics", "Analytics", "Tokens, cost, models", Icons.Outlined.Insights, 0xFF16A34A),
@@ -138,6 +139,8 @@ fun SettingsScreen(nav: NavHostController) {
         item {
             val nerd by app.store.nerd.collectAsState()
             HCard(padding = 8.dp) {
+                val mdIn by app.store.markdownInput.collectAsState()
+                SettingToggle("Markdown in my messages", "Format bar and live styling while typing; your sent messages render bold, lists, code and more", Icons.Outlined.TextFormat, mdIn) { app.store.set(app.store.markdownInput, "markdown_input", it) }
                 SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
             }
         }

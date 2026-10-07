@@ -1,6 +1,8 @@
 @file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package dev.hark.hermes.ui.screens
 
+import androidx.compose.ui.focus.onFocusChanged
+
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -61,6 +63,11 @@ fun ChatScreen(nav: NavHostController) {
     val loadingSession by g.loadingSession.collectAsStateWithLifecycle()
     val usage by g.usage.collectAsStateWithLifecycle()
     var input by remember { mutableStateOf("") }
+    // Cursor/selection for the composer; when `input` is replaced from elsewhere the cursor jumps to the end.
+    var fieldSel by remember { mutableStateOf(androidx.compose.ui.text.TextRange.Zero) }
+    var fieldText by remember { mutableStateOf("") }
+    var composerFocused by remember { mutableStateOf(false) }
+    var mdPreview by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
     var showModels by remember { mutableStateOf(false) }
     val reasoningLvl by g.reasoning.collectAsStateWithLifecycle()
@@ -390,6 +397,43 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
 
+        // markdown format bar + preview — shown while typing a message
+        val mdBarOn by app.store.markdownInput.collectAsStateWithLifecycle()
+        AnimatedVisibility(mdBarOn && composerFocused && !input.startsWith("/"), enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+            Column(Modifier.padding(horizontal = 14.dp)) {
+                AnimatedVisibility(mdPreview && input.isNotBlank()) {
+                    Box(Modifier.fillMaxWidth().heightIn(max = 260.dp).padding(bottom = 6.dp).clip(RoundedCornerShape(18.dp)).background(p.userBubble)
+                        .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp)) {
+                        Markdown(input, p.userInk)
+                    }
+                }
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(if (p.dark) p.sheet.copy(alpha = 0.9f) else androidx.compose.ui.graphics.Color.White)
+                    .horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    fun fmt(f: (androidx.compose.ui.text.input.TextFieldValue) -> androidx.compose.ui.text.input.TextFieldValue) {
+                        val cur = androidx.compose.ui.text.input.TextFieldValue(input, if (fieldText == input) fieldSel else androidx.compose.ui.text.TextRange(input.length))
+                        val v = f(cur); fieldText = v.text; fieldSel = v.selection; input = v.text
+                    }
+                    @Composable fun Key(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, on: Boolean = false, act: () -> Unit) =
+                        Box(Modifier.size(40.dp).clip(CircleShape).background(if (on) p.accentSoft else androidx.compose.ui.graphics.Color.Transparent).clickable { act() }, contentAlignment = Alignment.Center) {
+                            Icon(icon, label, tint = if (on) p.ink else p.muted, modifier = Modifier.size(20.dp))
+                        }
+                    Key(Icons.Outlined.FormatBold, "Bold") { fmt { it.wrap("**") } }
+                    Key(Icons.Outlined.FormatItalic, "Italic") { fmt { it.wrap("*") } }
+                    Key(Icons.Outlined.FormatStrikethrough, "Strikethrough") { fmt { it.wrap("~~") } }
+                    Key(Icons.Outlined.Code, "Inline code") { fmt { it.wrap("`") } }
+                    Key(Icons.Outlined.DataObject, "Code block") { fmt { v -> val nl = if (v.selection.min > 0 && v.text[v.selection.min - 1] != '\n') "\n" else ""; v.wrap("$nl```\n", "\n```") } }
+                    Key(Icons.Outlined.Title, "Heading") { fmt { it.linePrefix("## ") } }
+                    Key(Icons.Outlined.FormatListBulleted, "Bulleted list") { fmt { it.linePrefix("- ") } }
+                    Key(Icons.Outlined.FormatListNumbered, "Numbered list") { fmt { it.linePrefix("1. ") } }
+                    Key(Icons.Outlined.Checklist, "Checklist") { fmt { it.linePrefix("- [ ] ") } }
+                    Key(Icons.Outlined.FormatQuote, "Quote") { fmt { it.linePrefix("> ") } }
+                    Key(Icons.Outlined.Link, "Link") { fmt { v -> if (v.selection.collapsed) v.wrap("[", "](https://)") else v.wrap("[", "](https://)") } }
+                    Key(if (mdPreview) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility, "Preview", on = mdPreview) { mdPreview = !mdPreview }
+                }
+                Spacer(Modifier.height(2.dp))
+            }
+        }
+
         // composer — a floating glass pill with a bright send key
         Row(
             Modifier.padding(start = 14.dp, end = 14.dp, bottom = 12.dp, top = 8.dp).navigationBarsPadding()
@@ -404,9 +448,16 @@ fun ChatScreen(nav: NavHostController) {
             }
             Box(Modifier.weight(1f).heightIn(min = 48.dp).padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
                 if (input.isEmpty()) Text("Message or /command", color = p.faint, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp))
+                val mdOn by app.store.markdownInput.collectAsStateWithLifecycle()
+                val tfv = androidx.compose.ui.text.input.TextFieldValue(input,
+                    if (fieldText == input) androidx.compose.ui.text.TextRange(fieldSel.start.coerceIn(0, input.length), fieldSel.end.coerceIn(0, input.length)) else androidx.compose.ui.text.TextRange(input.length))
+                val mdTx = remember(p, mdOn) { if (mdOn) MarkdownInputTransformation(p) else androidx.compose.ui.text.input.VisualTransformation.None }
                 androidx.compose.foundation.text.BasicTextField(
-                    input, { input = it }, textStyle = MaterialTheme.typography.bodyLarge.copy(color = p.ink, fontSize = 17.sp),
-                    cursorBrush = androidx.compose.ui.graphics.SolidColor(p.ink), maxLines = 6, modifier = Modifier.fillMaxWidth(),
+                    tfv, { v -> fieldText = v.text; fieldSel = v.selection; input = v.text },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = p.ink, fontSize = 17.sp),
+                    visualTransformation = if (input.startsWith("/")) androidx.compose.ui.text.input.VisualTransformation.None else mdTx,
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(p.ink), maxLines = 6,
+                    modifier = Modifier.fillMaxWidth().onFocusChanged { composerFocused = it.isFocused },
                 )
             }
             val canSend = (input.isNotBlank() || attachments.isNotEmpty()) && uploading == 0
@@ -545,10 +596,14 @@ private fun ChatRow(item: ChatItem, canRegen: Boolean = false, stats: TurnStats?
             val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
             Column(Modifier.padding(start = 48.dp), horizontalAlignment = Alignment.End) {
                 SentAttachments(item.files)
-                if (item.text.isNotBlank()) Text(item.text, color = p.userInk, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 25.sp),
+                if (item.text.isNotBlank()) Box(
                     modifier = Modifier.entrance().clip(RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp))
                         .combinedClickable(onClick = {}, onLongClick = { haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress); open = true })
-                        .glass(RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp), p.userBubble).padding(horizontal = 20.dp, vertical = 15.dp))
+                        .glass(RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp), p.userBubble).padding(horizontal = 20.dp, vertical = 15.dp)) {
+                    val md by app.store.markdownInput.collectAsStateWithLifecycle()
+                    if (md) Markdown(item.text, p.userInk, body = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 25.sp))
+                    else Text(item.text, color = p.userInk, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 25.sp))
+                }
                 DropdownMenu(open, { open = false }, containerColor = p.sheet) {
                     if (item.ordinal >= 0) DropdownMenuItem({ Text("Edit") }, { open = false; onEdit(item) }, leadingIcon = { Icon(Icons.Outlined.Edit, null) })
                     DropdownMenuItem({ Text("Copy") }, { open = false; clip.setText(AnnotatedString(item.raw)) }, leadingIcon = { Icon(Icons.Outlined.ContentCopy, null) })

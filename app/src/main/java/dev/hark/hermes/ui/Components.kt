@@ -30,6 +30,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.em
 import dev.hark.hermes.data.ApiException
 import dev.hark.hermes.data.AuthExpired
 import kotlinx.coroutines.CoroutineScope
@@ -422,7 +423,7 @@ fun CodeBlock(text: String, maxHeight: Dp = 420.dp, lang: String = "", header: B
 
 // ── tiny markdown renderer ────────────────────────────────────────────────────
 @Composable
-fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Modifier = Modifier) {
+fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Modifier = Modifier, body: TextStyle = MaterialTheme.typography.bodyLarge) {
     val p = LocalPalette.current
     val blocks = remember(text) { mdBlocks(text) }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -431,15 +432,18 @@ fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Mo
                 is Md.Code -> if (b.lang in COPY_LANGS) CopyCard(b.text.trimEnd(), b.lang) else CodeBlock(b.text.trimEnd(), 360.dp, b.lang, header = true)
                 is Md.Table -> MdTable(b, color)
                 is Md.Heading -> Text(inline(b.text, p), style = when (b.level) { 1 -> MaterialTheme.typography.titleLarge; 2 -> MaterialTheme.typography.titleMedium; else -> MaterialTheme.typography.titleSmall }, color = color)
-                is Md.Bullet -> Row(Modifier.padding(start = (b.indent * 12).dp)) {
-                    Text(if (b.marker.isEmpty()) "•" else b.marker, color = p.muted, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.width(if (b.marker.length > 2) 30.dp else 18.dp))
-                    Text(inline(b.text, p), color = color, style = MaterialTheme.typography.bodyLarge)
+                is Md.Bullet -> Row(Modifier.padding(start = (b.indent * 14).dp), verticalAlignment = Alignment.Top) {
+                    when (b.check) {
+                        null -> Text(if (b.marker.isEmpty()) (if (b.indent % 2 == 0) "•" else "◦") else b.marker, color = p.muted, style = body, modifier = Modifier.width(if (b.marker.length > 2) 30.dp else 18.dp))
+                        else -> Icon(if (b.check) Icons.Outlined.CheckBox else Icons.Outlined.CheckBoxOutlineBlank, null, tint = if (b.check) p.accent else p.muted, modifier = Modifier.padding(top = 3.dp, end = 6.dp).size(18.dp))
+                    }
+                    Text(inline(b.text, p), color = if (b.check == true) p.muted else color, style = body.copy(textDecoration = if (b.check == true) androidx.compose.ui.text.style.TextDecoration.LineThrough else null))
                 }
                 is Md.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
                     Box(Modifier.width(3.dp).fillMaxHeight().background(p.line)); Spacer(Modifier.width(10.dp))
-                    Text(inline(b.text, p), color = p.muted, style = MaterialTheme.typography.bodyLarge)
+                    Markdown(b.text, p.muted, body = body)
                 }
-                is Md.Para -> Text(inline(b.text, p), color = color, style = MaterialTheme.typography.bodyLarge)
+                is Md.Para -> Text(inline(b.text, p), color = color, style = body)
                 Md.Rule -> HorizontalDivider(color = p.line)
                 is Md.Img -> dev.hark.hermes.ui.screens.ChatImage(b.src)
                 is Md.FileRef -> dev.hark.hermes.ui.screens.FileChips(listOf(b.path))
@@ -452,7 +456,7 @@ private sealed interface Md {
     data class Code(val text: String, val lang: String = "") : Md
     data class Table(val head: List<String>, val rows: List<List<String>>) : Md
     data class Heading(val level: Int, val text: String) : Md
-    data class Bullet(val marker: String, val text: String, val indent: Int) : Md
+    data class Bullet(val marker: String, val text: String, val indent: Int, val check: Boolean? = null) : Md
     data class Quote(val text: String) : Md
     data class Para(val text: String) : Md
     data class Img(val src: String) : Md
@@ -469,16 +473,24 @@ private fun mdBlocks(src: String): List<Md> {
     while (i < lines.size) {
         val raw = lines[i]; val l = raw.trimStart()
         when {
-            l.startsWith("```") -> {
-                flush(); val lang = l.removePrefix("```").trim().substringBefore(' ').lowercase(); val sb = StringBuilder(); i++
-                while (i < lines.size && !lines[i].trimStart().startsWith("```")) { sb.append(lines[i]).append('\n'); i++ }
+            l.startsWith("```") || l.startsWith("~~~") -> {
+                flush(); val fence = l.take(3); val lang = l.drop(3).trim().substringBefore(' ').lowercase(); val sb = StringBuilder(); i++
+                while (i < lines.size && !lines[i].trimStart().startsWith(fence)) { sb.append(lines[i]).append('\n'); i++ }
                 out += Md.Code(sb.toString(), lang)
             }
-            Regex("^#{1,6} ").containsMatchIn(l) -> { flush(); val n = l.takeWhile { it == '#' }.length; out += Md.Heading(n, l.drop(n).trim()) }
+            Regex("^#{1,6} ").containsMatchIn(l) -> { flush(); val n = l.takeWhile { it == '#' }.length; out += Md.Heading(n, l.drop(n).trim().trimEnd('#').trim()) }
+            l.matches(Regex("^(-{3,}|\\*{3,}|_{3,})$")) || l.replace(" ", "").matches(Regex("^(-{3,}|\\*{3,}|_{3,})$")) -> { flush(); out += Md.Rule }
+            para.isNotEmpty() && Regex("^(=+|-+)\\s*$").matches(l) -> {   // setext heading
+                val t = para.toString().trim(); para.clear(); out += Md.Heading(if (l.startsWith("=")) 1 else 2, t)
+            }
+            Regex("^[-*+] \\[[ xX]\\] ").containsMatchIn(l) -> { flush(); out += Md.Bullet("", l.drop(6), (raw.length - l.length) / 2, l[3] != ' ') }
             Regex("^[-*+] ").containsMatchIn(l) -> { flush(); out += Md.Bullet("", l.drop(2), (raw.length - l.length) / 2) }
             Regex("^\\d+[.)] ").containsMatchIn(l) -> { flush(); val m = l.substringBefore(' '); out += Md.Bullet(m, l.substringAfter(' '), (raw.length - l.length) / 2) }
-            l.startsWith(">") -> { flush(); out += Md.Quote(l.trimStart('>').trim()) }
-            l.matches(Regex("^(-{3,}|\\*{3,}|_{3,})$")) -> { flush(); out += Md.Rule }
+            l.startsWith(">") -> {
+                flush(); val sb = StringBuilder()
+                while (i < lines.size && lines[i].trimStart().startsWith(">")) { sb.append(lines[i].trimStart().removePrefix(">").removePrefix(" ")).append('\n'); i++ }
+                i--; out += Md.Quote(sb.toString().trimEnd())
+            }
             Regex("^!\\[[^\\]]*\\]\\(([^)\\s]+)[^)]*\\)$").matches(l.trim()) -> { flush(); out += Md.Img(Regex("\\(([^)\\s]+)").find(l)!!.groupValues[1]) }
             l.trim().startsWith("MEDIA:") -> {
                 flush(); val src = l.trim().removePrefix("MEDIA:").trim().trim('`', '"', '\'')
@@ -494,6 +506,9 @@ private fun mdBlocks(src: String): List<Md> {
                 out += Md.Table(head, rows)
             }
             l.isBlank() -> flush()
+            para.isEmpty() && raw.startsWith("  ") && out.lastOrNull() is Md.Bullet && lines.getOrNull(i - 1)?.isNotBlank() == true -> {
+                val b = out.removeAt(out.size - 1) as Md.Bullet; out += b.copy(text = b.text + "\n" + l)
+            }
             else -> { if (para.isNotEmpty()) para.append('\n'); para.append(raw) }
         }
         i++
@@ -519,7 +534,12 @@ private fun inline(s: String, p: Palette): AnnotatedString = buildAnnotatedStrin
     var i = 0
     while (i < s.length) {
         when {
-            s.startsWith("**", i) && s.indexOf("**", i + 2) > i -> { val e = s.indexOf("**", i + 2); withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(s.substring(i + 2, e)) }; i = e + 2 }
+            s[i] == '\\' && i + 1 < s.length && s[i + 1] in "\\`*_{}[]()#+-.!|~<>" -> { append(s[i + 1]); i += 2 }
+            s.startsWith("***", i) && s.indexOf("***", i + 3) > i + 3 -> { val e = s.indexOf("***", i + 3); withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, fontStyle = FontStyle.Italic)) { append(inline(s.substring(i + 3, e), p)) }; i = e + 3 }
+            s.startsWith("~~", i) && s.indexOf("~~", i + 2) > i + 2 -> { val e = s.indexOf("~~", i + 2); withStyle(SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough)) { append(inline(s.substring(i + 2, e), p)) }; i = e + 2 }
+            s.startsWith("__", i) && (i == 0 || !s[i - 1].isLetterOrDigit()) && s.indexOf("__", i + 2) > i + 2 -> { val e = s.indexOf("__", i + 2); withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(inline(s.substring(i + 2, e), p)) }; i = e + 2 }
+            s[i] == '<' && Regex("^<(https?://[^>\\s]+)>").find(s.substring(i)) != null -> { val m = Regex("^<(https?://[^>\\s]+)>").find(s.substring(i))!!; val u = m.groupValues[1]; linked(u, p) { append(u) }; i += m.value.length }
+            s.startsWith("**", i) && s.indexOf("**", i + 2) > i -> { val e = s.indexOf("**", i + 2); withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(inline(s.substring(i + 2, e), p)) }; i = e + 2 }
             s[i] == '`' && s.indexOf('`', i + 1) > i -> {
                 val e = s.indexOf('`', i + 1); val code = s.substring(i + 1, e)
                 if (isFilePath(code)) linked(code, p, mono = true) { append(" $code ") }
@@ -615,4 +635,80 @@ private fun MdTable(t: Md.Table, color: Color) {
             }
         }
     }
+}
+
+
+// ── live markdown styling for the composer ────────────────────────────────────
+/** Styles markdown as you type while keeping every character (markers are dimmed), so offsets map 1:1. */
+class MarkdownInputTransformation(private val p: Palette) : androidx.compose.ui.text.input.VisualTransformation {
+    override fun filter(text: AnnotatedString) = androidx.compose.ui.text.input.TransformedText(mdHighlight(text.text, p), androidx.compose.ui.text.input.OffsetMapping.Identity)
+}
+
+private val HL_RULES: List<Pair<Regex, (Palette) -> SpanStyle>> = listOf(
+    Regex("\\*\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*\\*") to { _ -> SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic) },
+    Regex("\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*") to { _ -> SpanStyle(fontWeight = FontWeight.Bold) },
+    Regex("(?<![\\w*])\\*(?=[^\\s*])(.+?)(?<=[^\\s*])\\*(?![\\w*])") to { _ -> SpanStyle(fontStyle = FontStyle.Italic) },
+    Regex("(?<!\\w)_(?=\\S)(.+?)(?<=\\S)_(?!\\w)") to { _ -> SpanStyle(fontStyle = FontStyle.Italic) },
+    Regex("~~(?=\\S)(.+?)(?<=\\S)~~") to { _ -> SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough) },
+    Regex("\\[([^\\]\\n]+)\\]\\([^)\\s]+\\)") to { pp -> SpanStyle(color = pp.accent) },
+)
+
+fun mdHighlight(src: String, p: Palette): AnnotatedString = buildAnnotatedString {
+    append(src)
+    val dim = SpanStyle(color = p.faint)
+    // fenced blocks first, then mask them so inline rules skip their contents
+    val masked = StringBuilder(src)
+    Regex("(?ms)^\\s*(```|~~~).*?(^\\s*\\1\\s*$|\\z)").findAll(src).forEach { m ->
+        addStyle(SpanStyle(fontFamily = Mono, background = p.code), m.range.first, m.range.last + 1)
+        for (k in m.range) masked.setCharAt(k, ' ')
+    }
+    Regex("`[^`\\n]+`").findAll(masked).forEach { m ->
+        addStyle(SpanStyle(fontFamily = Mono, background = p.code), m.range.first, m.range.last + 1)
+        addStyle(dim, m.range.first, m.range.first + 1); addStyle(dim, m.range.last, m.range.last + 1)
+        for (k in m.range) masked.setCharAt(k, ' ')
+    }
+    var off = 0
+    masked.toString().split('\n').forEach { line ->
+        Regex("^(#{1,6}) ").find(line)?.let { h ->
+            addStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = when (h.groupValues[1].length) { 1 -> 1.25.em; 2 -> 1.15.em; else -> 1.05.em }), off, off + line.length)
+            addStyle(dim, off, off + h.value.length)
+        }
+        Regex("^\\s*(>+|[-*+] (\\[[ xX]\\] )?|\\d+[.)] )").find(line)?.let { m -> addStyle(SpanStyle(color = p.accent, fontWeight = FontWeight.SemiBold), off + m.range.first, off + m.range.last + 1) }
+        if (line.trimStart().startsWith(">")) addStyle(SpanStyle(color = p.muted, fontStyle = FontStyle.Italic), off, off + line.length)
+        off += line.length + 1
+    }
+    HL_RULES.forEach { (re, st) ->
+        re.findAll(masked).forEach { m ->
+            val g = m.groups[1]!!.range
+            addStyle(st(p), g.first, g.last + 1)
+            addStyle(dim, m.range.first, g.first); addStyle(dim, g.last + 1, m.range.last + 1)
+        }
+    }
+}
+
+/** Wraps the selection (or the cursor) in [before]/[after]; with no selection the cursor lands between them. */
+fun androidx.compose.ui.text.input.TextFieldValue.wrap(before: String, after: String = before): androidx.compose.ui.text.input.TextFieldValue {
+    val a = selection.min; val b = selection.max
+    val sel = text.substring(a, b)
+    if (sel.startsWith(before) && sel.endsWith(after) && sel.length >= before.length + after.length) {
+        val inner = sel.substring(before.length, sel.length - after.length)
+        return copy(text.replaceRange(a, b, inner), TextRange(a, a + inner.length))
+    }
+    val t = text.replaceRange(a, b, before + sel + after)
+    return copy(t, if (a == b) TextRange(a + before.length) else TextRange(a + before.length, a + before.length + sel.length))
+}
+
+/** Toggles a line prefix ("- ", "1. ", "> ", "# ") on every line the selection touches. */
+fun androidx.compose.ui.text.input.TextFieldValue.linePrefix(prefix: String): androidx.compose.ui.text.input.TextFieldValue {
+    val start = text.lastIndexOf('\n', (selection.min - 1).coerceAtLeast(0)).let { if (selection.min == 0) 0 else it + 1 }.coerceAtLeast(0)
+    val end = text.indexOf('\n', selection.max).let { if (it < 0) text.length else it }
+    val lines = text.substring(start, end).split('\n')
+    val numbered = prefix == "1. "
+    val has = lines.all { if (numbered) Regex("^\\d+\\. ").containsMatchIn(it) else it.startsWith(prefix) }
+    val out = lines.mapIndexed { n, l ->
+        if (has) (if (numbered) l.replaceFirst(Regex("^\\d+\\. "), "") else l.removePrefix(prefix))
+        else (if (numbered) "${n + 1}. " else prefix) + l
+    }.joinToString("\n")
+    val t = text.replaceRange(start, end, out)
+    return copy(t, TextRange(start + out.length))
 }

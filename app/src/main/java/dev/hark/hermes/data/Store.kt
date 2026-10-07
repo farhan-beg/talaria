@@ -185,6 +185,14 @@ class Store(context: Context) {
     val nerd = flag("nerd_stats", false)
     /** Your fast-mode choice, re-applied to each chat (the server scopes it per session). */
     val fastPref = flag("fast_pref", false)
+    /** Voice mode reads replies with the TTS voice configured on Hermes instead of the phone's engine. */
+    val hermesVoice = flag("hermes_voice", false)
+    /** Markdown in your own messages: live styling + format bar in the composer, rendered in sent bubbles. */
+    val markdownInput = flag("markdown_input", true)
+    /** Phone TTS: voice name ("" = engine default), speech rate and pitch (1.0 = normal). */
+    val phoneVoice = str("phone_voice", "")
+    val phoneRate = str("phone_rate", "1.0")
+    val phonePitch = str("phone_pitch", "1.0")
     /** Sessions started on this phone. Hermes stamps them "tui" (the protocol we speak), so the label lives here. */
     val mineSessions = MutableStateFlow(prefs.getStringSet("mine_sessions", emptySet())!!.toSet())
     fun isMine(id: String) = id.isNotBlank() && id in mineSessions.value

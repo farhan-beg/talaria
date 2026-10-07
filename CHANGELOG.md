@@ -3,6 +3,22 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.9] - 2026-10-07 (versionCode 26)
+
+- Composer: live markdown styling (markers dimmed, offsets 1:1), format bar while typing (bold, italic, strikethrough, inline code, code block, heading, bullets, numbers, checklist, quote, link) with toggle-off on re-tap, and a rendered preview. Slash commands stay plain.
+- Sent messages render markdown in the bubble; Copy still copies the raw text.
+- Renderer: ~~strike~~, ***bold-italic***, __bold__, nested inline styles, backslash escapes, <autolinks>, task lists [ ]/[x], multi-line and nested blockquotes, bullet continuation lines, ~~~ fences, setext headings, trailing-# headings, spaced rules.
+- More > For nerds: "Markdown in my messages" switch (on by default).
+
+## [1.14.8] - 2026-10-07 (versionCode 25)
+
+- New More > Voice page: choose Phone or Hermes voice; Hermes provider picker (from server schema), per-provider voice/model/speed fields saved via PUT /api/config tts.*; ElevenLabs voice list from /api/audio/elevenlabs/voices; provider API key status/set via /api/env; test playback.
+- Phone voice: installed-voice picker, speed and pitch sliders, link to Android TTS settings.
+
+## [1.14.7] - 2026-10-07 (versionCode 24)
+
+- Voice mode: Phone voice / Hermes voice switch (also in More). Hermes voice reads replies through /api/audio/speak using the server tts: provider, sentence-chunked with prefetch, falls back to phone TTS with a visible note on failure.
+
 ## [1.14.6] - 2026-10-07 (versionCode 23)
 
 Applied on top of the released 1.14.5.

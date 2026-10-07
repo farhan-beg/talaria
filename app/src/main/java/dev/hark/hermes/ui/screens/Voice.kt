@@ -35,6 +35,7 @@ import dev.hark.hermes.data.ChatItem
 import dev.hark.hermes.ui.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import java.util.Locale
 
 /** On-device speech recognition with live partial results and a mic level for visuals. */
@@ -85,8 +86,17 @@ class Dictation(ctx: Context) {
     fun destroy() { rec?.destroy() }
 }
 
-/** Text-to-speech that reports when it finishes. */
-class Speaker(ctx: Context) {
+/**
+ * Text-to-speech that reports when it finishes. Speaks with the phone's TTS engine, or, when [hermes] is on,
+ * with the voice configured on the Hermes server (tts: in config.yaml, via /api/audio/speak), falling back
+ * to the phone if the server can't synthesize.
+ */
+class Speaker(private val ctx: Context, private val hermes: () -> Boolean = { false }) {
+    private val io = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main)
+    private var job: kotlinx.coroutines.Job? = null
+    private var player: android.media.MediaPlayer? = null
+    /** Set when the server voice failed, so the UI can say why it sounds different. */
+    var serverError by mutableStateOf<String?>(null); private set
     private var ready = false
     var speaking by mutableStateOf(false); private set
     private var done: () -> Unit = {}
@@ -101,8 +111,18 @@ class Speaker(ctx: Context) {
     fun speak(text: String, then: () -> Unit) {
         done = then
         val clean = speakable(text)
-        if (!ready || clean.isBlank()) { then(); return }
+        if (clean.isBlank()) { then(); return }
+        if (hermes()) { speakHermes(clean, then); return }
+        speakPhone(clean)
+    }
+
+    private fun speakPhone(clean: String) {
+        if (!ready) { speaking = false; done(); return }
         tts.language = Locale.getDefault()
+        val want = app.store.phoneVoice.value
+        if (want.isNotBlank()) runCatching { tts.voices?.firstOrNull { it.name == want }?.let { tts.voice = it } }
+        tts.setSpeechRate(app.store.phoneRate.value.toFloatOrNull()?.coerceIn(0.25f, 3f) ?: 1f)
+        tts.setPitch(app.store.phonePitch.value.toFloatOrNull()?.coerceIn(0.25f, 3f) ?: 1f)
         // split long replies so the engine never hits its input limit
         val chunks = clean.chunked(3500)
         chunks.forEachIndexed { i, c ->
@@ -110,8 +130,59 @@ class Speaker(ctx: Context) {
         }
         speaking = true
     }
-    fun stop() { tts.stop(); speaking = false }
-    fun shutdown() { tts.shutdown() }
+    /** Sentence-sized pieces so the first audio starts quickly; the next piece is synthesized while one plays. */
+    private fun pieces(t: String, max: Int = 450): List<String> {
+        val out = mutableListOf<String>(); val cur = StringBuilder()
+        Regex("[^.!?…]+[.!?…]*\\s*").findAll(t).map { it.value }.forEach { s ->
+            if (cur.length + s.length > max && cur.isNotEmpty()) { out += cur.toString().trim(); cur.clear() }
+            if (s.length > max) s.chunked(max).forEach { out += it.trim() } else cur.append(s)
+        }
+        if (cur.isNotBlank()) out += cur.toString().trim()
+        return out.filter { it.isNotBlank() }
+    }
+
+    private suspend fun synth(text: String): java.io.File = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val r = app.api.post("/api/audio/speak", kotlinx.serialization.json.buildJsonObject { put("text", kotlinx.serialization.json.JsonPrimitive(text)) })
+        val url = ((r as? kotlinx.serialization.json.JsonObject)?.get("data_url") as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
+        val comma = url.indexOf(',')
+        if (!url.startsWith("data:") || comma < 0) throw java.io.IOException("Hermes returned no audio")
+        val mime = url.substring(5, comma).substringBefore(';')
+        val ext = when { "wav" in mime -> ".wav"; "ogg" in mime || "opus" in mime -> ".ogg"; "flac" in mime -> ".flac"; else -> ".mp3" }
+        java.io.File.createTempFile("hermes-tts", ext, ctx.cacheDir).also { it.writeBytes(java.util.Base64.getDecoder().decode(url.substring(comma + 1))) }
+    }
+
+    private suspend fun play(f: java.io.File) = kotlinx.coroutines.suspendCancellableCoroutine<Unit> { c ->
+        val mp = android.media.MediaPlayer()
+        player = mp
+        fun finish() { runCatching { mp.release() }; if (player === mp) player = null; f.delete(); if (c.isActive) c.resumeWith(Result.success(Unit)) }
+        mp.setOnCompletionListener { finish() }
+        mp.setOnErrorListener { _, _, _ -> finish(); true }
+        c.invokeOnCancellation { runCatching { mp.stop() }; runCatching { mp.release() }; f.delete() }
+        try { mp.setDataSource(f.absolutePath); mp.setOnPreparedListener { it.start() }; mp.prepareAsync() } catch (e: Exception) { finish() }
+    }
+
+    private fun speakHermes(clean: String, then: () -> Unit) {
+        job?.cancel()
+        speaking = true
+        job = io.launch {
+            val parts = pieces(clean)
+            var next: kotlinx.coroutines.Deferred<java.io.File>? = async { synth(parts[0]) }
+            for (i in parts.indices) {
+                val f = try { next!!.await() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) {
+                    // server voice unavailable: say the rest with the phone's voice
+                    serverError = e.message ?: "Hermes voice unavailable"
+                    speakPhone(parts.drop(i).joinToString(" ")); return@launch
+                }
+                serverError = null
+                next = if (i + 1 < parts.size) async { synth(parts[i + 1]) } else null
+                play(f)
+            }
+            speaking = false; then()
+        }
+    }
+
+    fun stop() { job?.cancel(); job = null; runCatching { player?.stop() }; tts.stop(); speaking = false }
+    fun shutdown() { stop(); tts.shutdown(); io.coroutineContext[kotlinx.coroutines.Job]?.cancel() }
 }
 
 /** Strips markdown and code so replies read naturally out loud. */
@@ -138,7 +209,8 @@ fun VoiceMode(onClose: () -> Unit) {
     val g = app.gateway
     val scope = rememberCoroutineScope()
     val dict = remember { Dictation(ctx) }
-    val speaker = remember { Speaker(ctx) }
+    val hermesVoice by app.store.hermesVoice.collectAsStateWithLifecycle()
+    val speaker = remember { Speaker(ctx) { app.store.hermesVoice.value } }
     val busy by g.busy.collectAsStateWithLifecycle()
     val items by g.items.collectAsStateWithLifecycle()
     var phase by remember { mutableStateOf(Phase.Listening) }
@@ -188,6 +260,17 @@ fun VoiceMode(onClose: () -> Unit) {
                     when (phase) { Phase.Listening -> "Listening"; Phase.Thinking -> "Thinking"; Phase.Speaking -> "Speaking"; Phase.Paused -> if (dict.available) "Paused" else "Speech recognition isn't available" },
                     color = p.muted, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 24.dp),
                 )
+                Spacer(Modifier.height(10.dp))
+                // which voice reads replies: the phone's TTS engine (free, offline) or the one set up on Hermes
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(false to "Phone voice", true to "Hermes voice").forEach { (h, label) ->
+                        val on = hermesVoice == h
+                        Text(label, color = if (on) p.ink else p.muted, style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.clip(CircleShape).background(if (on) p.accentSoft else Color.Transparent)
+                                .clickable { app.store.set(app.store.hermesVoice, "hermes_voice", h) }.padding(horizontal = 12.dp, vertical = 6.dp))
+                    }
+                }
+                speaker.serverError?.let { if (hermesVoice) Text("Hermes voice failed, using the phone's: " + it.take(80), color = p.warn, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp)) }
                 Spacer(Modifier.weight(1f))
                 Orb(phase, dict.level, Modifier.size(240.dp).clip(CircleShape).clickable {
                     when (phase) {

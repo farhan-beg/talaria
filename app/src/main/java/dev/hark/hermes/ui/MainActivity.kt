@@ -165,6 +165,7 @@ private fun Shell() {
             composable("models") { ModelsScreen(nav) }
             composable("config") { ConfigScreen(nav) }
             composable("keys") { KeysScreen(nav) }
+            composable("voice") { VoiceSettingsScreen(nav) }
             composable("mcp") { McpScreen(nav) }
             composable("channels") { ChannelsScreen(nav) }
             composable("pairing") { PairingScreen(nav) }
