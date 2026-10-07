@@ -3,6 +3,14 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.11] - 2026-10-07 (versionCode 28)
+
+### Fixed
+- Wrong part of the reply showed: when Hermes replied, then used a tool (like saving to memory) and added a closing line, only the closing line appeared and the real reply was hidden in "Worked for". Everything written in a turn now shows in the reply bubble, in order; tools and thinking stay folded in "Worked for". Copy and regenerate cover the full reply.
+
+### Added
+- More > For nerds > "Full reply" switch (on by default); turn it off for the old behaviour.
+
 ## [1.14.10] - 2026-10-07 (versionCode 27)
 
 ### Fixed

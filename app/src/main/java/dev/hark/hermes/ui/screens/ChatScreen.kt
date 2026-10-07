@@ -207,7 +207,8 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
     }
-    val rows = remember(items, busy) { foldTurns(items, busy) }
+    val keepInterim by app.store.interimInReply.collectAsStateWithLifecycle()
+    val rows = remember(items, busy, keepInterim) { foldTurns(items, busy, keepInterim) }
     // follow the stream only while the reader is at the bottom; a drag up pins the view where they are
     var stick by remember { mutableStateOf(true) }
     val dragged by listState.interactionSource.collectIsDraggedAsState()

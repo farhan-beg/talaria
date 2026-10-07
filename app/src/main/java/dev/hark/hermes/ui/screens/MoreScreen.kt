@@ -141,7 +141,9 @@ fun SettingsScreen(nav: NavHostController) {
             HCard(padding = 8.dp) {
                 val mdIn by app.store.markdownInput.collectAsState()
                 SettingToggle("Markdown in my messages", "Format bar and live styling while typing; your sent messages render bold, lists, code and more", Icons.Outlined.TextFormat, mdIn) { app.store.set(app.store.markdownInput, "markdown_input", it) }
-                SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
+                val interimOn by app.store.interimInReply.collectAsState()
+                SettingToggle("Full reply", "Words Hermes writes between tool calls show in the reply, not tucked into \"Worked for\"", Icons.Outlined.Notes, interimOn) { app.store.set(app.store.interimInReply, "interim_in_reply", it) }
+                                SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
             }
         }
         item { SectionLabel("Sessions") }

@@ -189,6 +189,8 @@ class Store(context: Context) {
     val hermesVoice = flag("hermes_voice", false)
     /** Markdown in your own messages: live styling + format bar in the composer, rendered in sent bubbles. */
     val markdownInput = flag("markdown_input", true)
+    /** Text written between tool calls joins the reply bubble instead of hiding in "Worked for". */
+    val interimInReply = flag("interim_in_reply", true)
     /** Phone TTS: voice name ("" = engine default), speech rate and pitch (1.0 = normal). */
     val phoneVoice = str("phone_voice", "")
     val phoneRate = str("phone_rate", "1.0")

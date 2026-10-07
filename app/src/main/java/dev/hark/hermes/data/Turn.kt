@@ -16,7 +16,7 @@ sealed interface Seg {
  * Folds every turn's reasoning, tool calls and interim notes into a single Work block, leaving only
  * the user's message, the final answer (with its reasoning moved into the block) and any notices.
  */
-fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
+fun foldTurns(items: List<ChatItem>, busy: Boolean, keepInterim: Boolean = true): List<Seg> {
     val out = mutableListOf<Seg>()
     var i = 0
     while (i < items.size) {
@@ -33,6 +33,9 @@ fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
         var placed = false
         var tail = 0L
         val rows = mutableListOf<Seg>()
+        // Text the agent wrote to you between tool calls ("Ha, exactly." → memory save → "That's a wrap") is part of
+        // the reply, not behind-the-scenes work: once the turn has an answer, it all goes into the answer bubble.
+        val interim = if (keepInterim && ansIdx >= 0) turn.withIndex().filter { (n, x) -> n < ansIdx && x is ChatItem.Assistant && x.text.isNotBlank() }.map { it.index }.toSet() else emptySet()
         turn.forEachIndexed { n, it ->
             when {
                 n == ansIdx -> {
@@ -40,7 +43,13 @@ fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
                     if (a.reasoning.isNotBlank()) steps += a.copy(key = a.key + "-r", text = "")
                     tail = maxOf(a.endMs, a.firstMs)
                     if (!placed && steps.isNotEmpty()) { rows += Seg.Work("w-" + steps.first().key, steps.toList(), live, tail); placed = true }
-                    rows += Seg.Item(a.copy(reasoning = ""), TurnStats.of(turn.filterIsInstance<ChatItem.Assistant>()))
+                    val text = (interim.sorted().map { (turn[it] as ChatItem.Assistant).text.trim() } + a.text).joinToString("\n\n")
+                    rows += Seg.Item(a.copy(reasoning = "", text = text), TurnStats.of(turn.filterIsInstance<ChatItem.Assistant>()))
+                }
+                n in interim -> {
+                    // its thinking stays in the work block; its words move to the answer
+                    val x = it as ChatItem.Assistant
+                    if (x.reasoning.isNotBlank()) steps += x.copy(key = x.key + "-r", text = "")
                 }
                 it is ChatItem.Tool || it is ChatItem.Assistant -> {
                     steps += it
