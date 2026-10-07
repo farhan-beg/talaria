@@ -396,8 +396,22 @@ fun FormSheet(title: String, onDismiss: () -> Unit, confirm: String = "Save", on
 }
 
 @Composable
-fun CodeBlock(text: String, maxHeight: Dp = 420.dp) {
+fun CodeBlock(text: String, maxHeight: Dp = 420.dp, lang: String = "", header: Boolean = false) {
     val p = LocalPalette.current
+    if (header) {
+        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.code)) {
+            Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(lang.ifBlank { "code" }, color = p.faint, fontFamily = Mono, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                CopyButton(text); ShareButton(text)
+            }
+            SelectionContainer {
+                Box(Modifier.fillMaxWidth().heightIn(max = maxHeight).verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, bottom = 12.dp)) {
+                    Text(text, fontFamily = Mono, fontSize = 12.sp, lineHeight = 17.sp, color = p.ink)
+                }
+            }
+        }
+        return
+    }
     SelectionContainer {
         Box(Modifier.fillMaxWidth().heightIn(max = maxHeight).clip(RoundedCornerShape(14.dp)).background(p.code)
             .verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()).padding(12.dp)) {
@@ -414,7 +428,8 @@ fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Mo
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { b ->
             when (b) {
-                is Md.Code -> CodeBlock(b.text.trimEnd(), 360.dp)
+                is Md.Code -> if (b.lang in COPY_LANGS) CopyCard(b.text.trimEnd(), b.lang) else CodeBlock(b.text.trimEnd(), 360.dp, b.lang, header = true)
+                is Md.Table -> MdTable(b, color)
                 is Md.Heading -> Text(inline(b.text, p), style = when (b.level) { 1 -> MaterialTheme.typography.titleLarge; 2 -> MaterialTheme.typography.titleMedium; else -> MaterialTheme.typography.titleSmall }, color = color)
                 is Md.Bullet -> Row(Modifier.padding(start = (b.indent * 12).dp)) {
                     Text(if (b.marker.isEmpty()) "•" else b.marker, color = p.muted, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.width(if (b.marker.length > 2) 30.dp else 18.dp))
@@ -426,17 +441,22 @@ fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Mo
                 }
                 is Md.Para -> Text(inline(b.text, p), color = color, style = MaterialTheme.typography.bodyLarge)
                 Md.Rule -> HorizontalDivider(color = p.line)
+                is Md.Img -> dev.hark.hermes.ui.screens.ChatImage(b.src)
+                is Md.FileRef -> dev.hark.hermes.ui.screens.FileChips(listOf(b.path))
             }
         }
     }
 }
 
 private sealed interface Md {
-    data class Code(val text: String) : Md
+    data class Code(val text: String, val lang: String = "") : Md
+    data class Table(val head: List<String>, val rows: List<List<String>>) : Md
     data class Heading(val level: Int, val text: String) : Md
     data class Bullet(val marker: String, val text: String, val indent: Int) : Md
     data class Quote(val text: String) : Md
     data class Para(val text: String) : Md
+    data class Img(val src: String) : Md
+    data class FileRef(val path: String) : Md
     data object Rule : Md
 }
 
@@ -450,15 +470,29 @@ private fun mdBlocks(src: String): List<Md> {
         val raw = lines[i]; val l = raw.trimStart()
         when {
             l.startsWith("```") -> {
-                flush(); val sb = StringBuilder(); i++
+                flush(); val lang = l.removePrefix("```").trim().substringBefore(' ').lowercase(); val sb = StringBuilder(); i++
                 while (i < lines.size && !lines[i].trimStart().startsWith("```")) { sb.append(lines[i]).append('\n'); i++ }
-                out += Md.Code(sb.toString())
+                out += Md.Code(sb.toString(), lang)
             }
             Regex("^#{1,6} ").containsMatchIn(l) -> { flush(); val n = l.takeWhile { it == '#' }.length; out += Md.Heading(n, l.drop(n).trim()) }
             Regex("^[-*+] ").containsMatchIn(l) -> { flush(); out += Md.Bullet("", l.drop(2), (raw.length - l.length) / 2) }
             Regex("^\\d+[.)] ").containsMatchIn(l) -> { flush(); val m = l.substringBefore(' '); out += Md.Bullet(m, l.substringAfter(' '), (raw.length - l.length) / 2) }
             l.startsWith(">") -> { flush(); out += Md.Quote(l.trimStart('>').trim()) }
             l.matches(Regex("^(-{3,}|\\*{3,}|_{3,})$")) -> { flush(); out += Md.Rule }
+            Regex("^!\\[[^\\]]*\\]\\(([^)\\s]+)[^)]*\\)$").matches(l.trim()) -> { flush(); out += Md.Img(Regex("\\(([^)\\s]+)").find(l)!!.groupValues[1]) }
+            l.trim().startsWith("MEDIA:") -> {
+                flush(); val src = l.trim().removePrefix("MEDIA:").trim().trim('`', '"', '\'')
+                if (src.isNotBlank()) out += if (dev.hark.hermes.ui.screens.isImageName(src) || src.startsWith("http")) Md.Img(src) else Md.FileRef(src)
+            }
+            l.startsWith("|") && i + 1 < lines.size && lines[i + 1].trim().matches(Regex("^\\|?\\s*:?-{2,}.*")) -> {
+                flush()
+                fun cells(r: String) = r.trim().trim('|').split('|').map { it.trim() }
+                val head = cells(l); i += 2
+                val rows = mutableListOf<List<String>>()
+                while (i < lines.size && lines[i].trimStart().startsWith("|")) { rows += cells(lines[i]); i++ }
+                i--
+                out += Md.Table(head, rows)
+            }
             l.isBlank() -> flush()
             else -> { if (para.isNotEmpty()) para.append('\n'); para.append(raw) }
         }
@@ -468,18 +502,45 @@ private fun mdBlocks(src: String): List<Md> {
     return out
 }
 
+private val FILE_AT = Regex("""/(?:[\w.\-@+~]+/)+[\w.\-@+~]+\.[A-Za-z0-9]{1,8}(?![\w/])""")
+private fun isFilePath(t: String) = (t.startsWith("/") || t.startsWith("~/")) && !t.contains(' ') && FILE_AT.matches(t.replaceFirst("~", "/~"))
+
+/** Web links open in the browser; paths on Hermes' machine open in the in-app file viewer. */
+private inline fun androidx.compose.ui.text.AnnotatedString.Builder.linked(target: String, p: Palette, mono: Boolean = false, body: androidx.compose.ui.text.AnnotatedString.Builder.() -> Unit) {
+    val style = androidx.compose.ui.text.TextLinkStyles(SpanStyle(color = p.accent, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline, fontFamily = if (mono) Mono else null, background = if (mono) p.code else Color.Unspecified))
+    val ann: androidx.compose.ui.text.LinkAnnotation = when {
+        target.startsWith("http://") || target.startsWith("https://") || target.startsWith("mailto:") -> androidx.compose.ui.text.LinkAnnotation.Url(target, style)
+        else -> androidx.compose.ui.text.LinkAnnotation.Clickable(target, style) { dev.hark.hermes.ui.screens.FileOpen.open(target.removePrefix("file://")) }
+    }
+    withLink(ann) { body() }
+}
+
 private fun inline(s: String, p: Palette): AnnotatedString = buildAnnotatedString {
     var i = 0
     while (i < s.length) {
         when {
             s.startsWith("**", i) && s.indexOf("**", i + 2) > i -> { val e = s.indexOf("**", i + 2); withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(s.substring(i + 2, e)) }; i = e + 2 }
-            s[i] == '`' && s.indexOf('`', i + 1) > i -> { val e = s.indexOf('`', i + 1); withStyle(SpanStyle(fontFamily = Mono, background = p.code, fontSize = 13.5.sp)) { append(" " + s.substring(i + 1, e) + " ") }; i = e + 1 }
+            s[i] == '`' && s.indexOf('`', i + 1) > i -> {
+                val e = s.indexOf('`', i + 1); val code = s.substring(i + 1, e)
+                if (isFilePath(code)) linked(code, p, mono = true) { append(" $code ") }
+                else withStyle(SpanStyle(fontFamily = Mono, background = p.code, fontSize = 13.5.sp)) { append(" $code ") }
+                i = e + 1
+            }
+            (s.startsWith("http://", i) || s.startsWith("https://", i)) && (i == 0 || !s[i - 1].isLetterOrDigit()) -> {
+                var e = i; while (e < s.length && !s[e].isWhitespace() && s[e] != ')' && s[e] != '>' && s[e] != '"') e++
+                while (e > i && s[e - 1] in ".,;:!?'") e--
+                val url = s.substring(i, e); linked(url, p) { append(url) }; i = e
+            }
+            s[i] == '/' && (i == 0 || s[i - 1].isWhitespace() || s[i - 1] == '(') && FILE_AT.matchAt(s, i) != null -> {
+                val m = FILE_AT.matchAt(s, i)!!; linked(m.value, p, mono = true) { append(m.value) }; i += m.value.length
+            }
             (s[i] == '*' || s[i] == '_') && i + 1 < s.length && s[i + 1] != ' ' && s.indexOf(s[i], i + 1) > i + 1 && (i == 0 || !s[i - 1].isLetterOrDigit()) -> {
                 val e = s.indexOf(s[i], i + 1); withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(s.substring(i + 1, e)) }; i = e + 1
             }
             s[i] == '[' && s.indexOf("](", i) > i && s.indexOf(')', s.indexOf("](", i)) > 0 -> {
                 val mid = s.indexOf("](", i); val end = s.indexOf(')', mid)
-                withStyle(SpanStyle(color = p.accent, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)) { append(s.substring(i + 1, mid)) }
+                val target = s.substring(mid + 2, end).trim().substringBefore(' ')
+                linked(target, p) { append(s.substring(i + 1, mid)) }
                 i = end + 1
             }
             else -> { append(s[i]); i++ }
@@ -493,3 +554,65 @@ fun Toggle(checked: Boolean, onChange: (Boolean) -> Unit) {
     Switch(checked, onChange, colors = SwitchDefaults.colors(checkedTrackColor = p.accent, checkedThumbColor = p.accentInk, uncheckedTrackColor = p.cardAlt, uncheckedBorderColor = p.line))
 }
 
+
+
+/** Fence languages Hermes can use to hand you a ready-to-send piece of text instead of code. */
+val COPY_LANGS = setOf("copy", "template", "text-template", "email", "message", "draft", "reply", "prompt", "tweet", "post")
+
+@Composable
+fun CopyButton(text: String) {
+    val p = LocalPalette.current
+    val clip = androidx.compose.ui.platform.LocalClipboardManager.current
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    var done by remember { mutableStateOf(false) }
+    LaunchedEffect(done) { if (done) { kotlinx.coroutines.delay(1400); done = false } }
+    Row(Modifier.clip(RoundedCornerShape(50)).clickable {
+        clip.setText(androidx.compose.ui.text.AnnotatedString(text)); done = true
+        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+    }.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(if (done) Icons.Outlined.Check else Icons.Outlined.ContentCopy, "Copy", tint = if (done) p.good else p.faint, modifier = Modifier.size(15.dp))
+        Spacer(Modifier.width(4.dp))
+        Text(if (done) "Copied" else "Copy", color = if (done) p.good else p.faint, fontSize = 11.sp)
+    }
+}
+
+@Composable
+fun ShareButton(text: String) {
+    val p = LocalPalette.current
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    Icon(Icons.Outlined.Share, "Share", tint = p.faint, modifier = Modifier.size(30.dp).clip(CircleShape).clickable {
+        ctx.startActivity(android.content.Intent.createChooser(android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain").putExtra(android.content.Intent.EXTRA_TEXT, text), null))
+    }.padding(7.dp))
+}
+
+/** A ready-to-send draft (```email, ```message, ```copy …): reads like text, one tap to copy or share. */
+@Composable
+fun CopyCard(text: String, lang: String) {
+    val p = LocalPalette.current
+    val subject = text.lineSequence().firstOrNull()?.takeIf { it.startsWith("Subject:", true) }?.substringAfter(':')?.trim()
+    val title = subject ?: when (lang) { "email" -> "Email"; "message", "reply" -> "Message"; "prompt" -> "Prompt"; "tweet", "post" -> "Post"; "draft" -> "Draft"; else -> "Ready to copy" }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(p.card).border(1.dp, p.line, RoundedCornerShape(18.dp)).padding(14.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Description, null, tint = p.accent, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(8.dp))
+            Text(title, color = p.ink, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            CopyButton(text); ShareButton(text)
+        }
+        Spacer(Modifier.height(6.dp))
+        SelectionContainer { Text(text, color = p.ink, style = MaterialTheme.typography.bodyMedium) }
+    }
+}
+
+@Composable
+private fun MdTable(t: Md.Table, color: Color) {
+    val p = LocalPalette.current
+    val cols = maxOf(t.head.size, t.rows.maxOfOrNull { it.size } ?: 0)
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).border(1.dp, p.line, RoundedCornerShape(14.dp)).horizontalScroll(rememberScrollState())) {
+        Column {
+            Row(Modifier.background(p.code)) { (0 until cols).forEach { c -> Text(t.head.getOrElse(c) { "" }, color = color, style = MaterialTheme.typography.labelLarge, modifier = Modifier.widthIn(min = 90.dp, max = 220.dp).padding(10.dp)) } }
+            t.rows.forEachIndexed { n, r ->
+                if (n > 0) HorizontalDivider(color = p.line)
+                Row { (0 until cols).forEach { c -> Text(inline(r.getOrElse(c) { "" }, p), color = color, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.widthIn(min = 90.dp, max = 220.dp).padding(10.dp)) } }
+            }
+        }
+    }
+}

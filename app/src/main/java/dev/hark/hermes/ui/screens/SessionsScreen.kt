@@ -24,7 +24,6 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-private val AUTOMATION = setOf("cron", "tool", "api", "acp")
 
 @Composable
 fun SessionsScreen(nav: NavHostController) {

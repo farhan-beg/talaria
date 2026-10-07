@@ -29,6 +29,7 @@ private val groups = listOf(
         Dest("skills", "Skills & tools", "Toggle, browse the hub", Icons.Outlined.Extension, 0xFF7A5AF8),
         Dest("profiles", "Profiles", "Isolated Hermes instances", Icons.Outlined.People, 0xFF2E7DD7),
         Dest("memory", "Memory", "Providers and built-in stores", Icons.Outlined.Psychology, 0xFFC2410C),
+        Dest("files", "Files", "Browse, preview, upload, download", Icons.Outlined.FolderOpen, 0xFFCA8A04),
     ),
     "Insights" to listOf(
         Dest("analytics", "Analytics", "Tokens, cost, models", Icons.Outlined.Insights, 0xFF16A34A),
@@ -102,11 +103,13 @@ fun SettingsScreen(nav: NavHostController) {
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(me.data?.sn("display_name") ?: me.data?.sn("email") ?: auth.userId.take(18).ifBlank { "Signed in" }, style = MaterialTheme.typography.titleMedium, color = p.ink)
-                        Text("via ${auth.provider.ifBlank { "dashboard" }} · ${app.api.base.removePrefix("https://").removePrefix("http://")}", style = MaterialTheme.typography.bodySmall, color = p.muted)
+                        Text("via ${auth.provider.ifBlank { "dashboard" }} · ${auth.label}", style = MaterialTheme.typography.bodySmall, color = p.muted)
                     }
                 }
             }
         }
+        item { SectionLabel("Servers") }
+        item { ServersCard() }
         item { SectionLabel("Theme") }
         item { ThemePicker() }
         item { ChipRow(listOf("system" to "System", "light" to "Light", "dark" to "Dark", "amoled" to "Pure black"), theme) { app.store.setTheme(it) } }
@@ -152,10 +155,10 @@ fun SettingsScreen(nav: NavHostController) {
         item {
             HCard(padding = 8.dp) {
                 ListRow("Sign out", "Forget tokens on this phone", Icons.Outlined.Logout, p.bad, onClick = { signOut = true })
-                ListRow("Switch server", "Connect to a different dashboard", Icons.Outlined.SwapHoriz, onClick = { app.gateway.reset(); app.store.forget() })
+                ListRow("Add server", "Connect another Hermes dashboard", Icons.Outlined.Add, onClick = { app.gateway.reset(); app.store.addServer() })
             }
         }
-        item { Text("Talaria 1.9.0  ·  for Hermes Agent", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) }
+        item { Text("Talaria 1.14.0  ·  for Hermes Agent", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) }
     }
     if (signOut) ConfirmDialog("Sign out?", "You'll need to sign in with your dashboard OAuth again.", "Sign out", danger = true, { signOut = false }) {
         app.gateway.reset(); app.store.signOut()
@@ -195,5 +198,51 @@ private fun ThemePicker() {
                 Spacer(Modifier.height(2.dp))
             }
         }
+    }
+}
+
+
+/** Every saved server: tap to switch, rename to something you'll recognise, or remove. */
+@Composable
+private fun ServersCard() {
+    val p = LocalPalette.current
+    val servers by app.store.servers.collectAsState()
+    val active by app.store.activeId.collectAsState()
+    var renaming by remember { mutableStateOf<dev.hark.hermes.data.Store.Server?>(null) }
+    var removing by remember { mutableStateOf<dev.hark.hermes.data.Store.Server?>(null) }
+    HCard(padding = 8.dp) {
+        servers.forEach { sv ->
+            var menu by remember { mutableStateOf(false) }
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { if (sv.id != active) switchServer(sv.id) }.padding(horizontal = 10.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(if (sv.id == active) Icons.Outlined.CheckCircle else Icons.Outlined.Dns, null, tint = if (sv.id == active) p.good else p.muted)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(sv.auth.label, color = p.ink, style = MaterialTheme.typography.titleSmall)
+                    Text(sv.auth.host + if (!sv.auth.isSignedIn) " · signed out" else "", color = p.faint, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                }
+                Box {
+                    IconButton({ menu = true }) { Icon(Icons.Outlined.MoreVert, "Options", tint = p.faint) }
+                    DropdownMenu(menu, { menu = false }, containerColor = p.sheet) {
+                        DropdownMenuItem({ Text("Rename") }, { menu = false; renaming = sv }, leadingIcon = { Icon(Icons.Outlined.Edit, null) })
+                        DropdownMenuItem({ Text("Remove", color = p.bad) }, { menu = false; removing = sv }, leadingIcon = { Icon(Icons.Outlined.Delete, null, tint = p.bad) })
+                    }
+                }
+            }
+        }
+    }
+    renaming?.let { sv ->
+        var name by remember(sv.id) { mutableStateOf(sv.auth.name) }
+        AlertDialog({ renaming = null }, containerColor = p.sheet,
+            title = { Text("Name this server") },
+            text = { OutlinedTextField(name, { name = it }, singleLine = true, placeholder = { Text(sv.auth.host) }, shape = RoundedCornerShape(14.dp)) },
+            confirmButton = { TextButton({ app.store.renameServer(sv.id, name); renaming = null }) { Text("Save") } },
+            dismissButton = { TextButton({ renaming = null }) { Text("Cancel") } })
+    }
+    removing?.let { sv ->
+        AlertDialog({ removing = null }, containerColor = p.sheet,
+            title = { Text("Remove ${sv.auth.label}?") },
+            text = { Text("Its sign-in is forgotten on this phone. Nothing changes on the server.") },
+            confirmButton = { TextButton({ val wasActive = sv.id == active; if (wasActive) app.gateway.reset(); app.store.removeServer(sv.id); if (wasActive && app.store.auth.value.isSignedIn) app.gateway.connect(); removing = null }) { Text("Remove", color = p.bad) } },
+            dismissButton = { TextButton({ removing = null }) { Text("Cancel") } })
     }
 }

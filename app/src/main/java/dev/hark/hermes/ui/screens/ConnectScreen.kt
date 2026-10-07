@@ -1,5 +1,6 @@
 package dev.hark.hermes.ui.screens
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -33,6 +34,8 @@ fun ConnectScreen() {
     val scope = rememberCoroutineScope()
     val saved = app.store.auth.value
     var url by remember { mutableStateOf(saved.baseUrl) }
+    var name by remember { mutableStateOf(saved.name) }
+    val others by app.store.servers.collectAsState()
     var status by remember { mutableStateOf<JsonObject?>(null) }
     var busy by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf<String?>(null) }
@@ -61,6 +64,7 @@ fun ConnectScreen() {
             } else {
                 app.auth.signIn(url, pwProviders.firstOrNull() ?: "basic", user.trim(), pass)
             }
+            if (name.isNotBlank()) app.store.update { it.copy(name = name.trim()) }
         } catch (e: kotlinx.coroutines.CancellationException) { throw e
         } catch (e: Exception) { err = errText(e) }
         busy = false
@@ -82,7 +86,34 @@ fun ConnectScreen() {
         Text("Connect to the Hermes dashboard running on your server. You'll sign in right here with your dashboard username and password.",
             style = MaterialTheme.typography.bodyLarge, color = p.muted)
         Spacer(Modifier.height(28.dp))
+        val saved2 = others.filter { it.auth.isSignedIn }
+        if (saved2.isNotEmpty()) {
+            Text("Your servers", style = MaterialTheme.typography.labelLarge, color = p.muted)
+            Spacer(Modifier.height(8.dp))
+            saved2.forEach { sv ->
+                Row(Modifier.fillMaxWidth().padding(bottom = 8.dp).clip(RoundedCornerShape(18.dp)).background(p.card).then(Modifier.clickable { switchServer(sv.id) }).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Dns, null, tint = p.accent); Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(sv.auth.label, color = p.ink, style = MaterialTheme.typography.titleSmall)
+                        Text(sv.auth.host, color = p.faint, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                    }
+                    Icon(Icons.Outlined.ArrowForward, null, tint = p.faint)
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text("Or add another", style = MaterialTheme.typography.labelLarge, color = p.muted)
+            Spacer(Modifier.height(8.dp))
+        }
 
+        OutlinedTextField(
+            name, { name = it }, label = { Text("Name (optional)") }, singleLine = true,
+            placeholder = { Text("Home lab, VPS, Work…", color = p.faint) },
+            leadingIcon = { Icon(Icons.Outlined.Label, null, tint = p.muted) },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = p.card, focusedContainerColor = p.card, unfocusedBorderColor = p.line, focusedBorderColor = p.ink.copy(alpha = 0.5f), focusedLabelColor = p.ink, cursorColor = p.ink),
+        )
+        Spacer(Modifier.height(10.dp))
         OutlinedTextField(
             url, { url = it; status = null }, label = { Text("Dashboard URL") }, singleLine = true,
             placeholder = { Text("https://hermes.example.com", color = p.faint) },
@@ -179,4 +210,12 @@ private fun PrimaryAction(text: String, icon: androidx.compose.ui.graphics.vecto
         if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = p.accentInk)
         else { Icon(icon, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(text) }
     }
+}
+
+
+/** Moves the whole app to another saved server: drops the live chat, swaps tokens, reconnects. */
+fun switchServer(id: String) {
+    app.gateway.reset()
+    app.store.switchTo(id)
+    if (app.store.auth.value.isSignedIn) app.gateway.connect()
 }

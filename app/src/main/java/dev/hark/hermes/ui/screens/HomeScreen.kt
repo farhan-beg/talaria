@@ -26,21 +26,26 @@ import kotlinx.serialization.json.JsonObject
 fun HomeScreen(nav: NavHostController) {
     val p = LocalPalette.current
     val scope = rememberCoroutineScope()
-    val profile by app.store.profile.collectAsState()
+    val profile0 by app.store.profile.collectAsState()
+    val server by app.store.activeId.collectAsState()
+    val auth by app.store.auth.collectAsState()
+    // reload everything when you switch servers, not just profiles
+    val profile = profile0 + "@" + server
     val status = rememberLoad(profile, poll = 8000) { app.api.obj("/api/status", profile = false) }
     val bgSessions by app.store.showBackground.collectAsState()
     val sessions = rememberLoad(profile, bgSessions) { app.api.obj(sessionsUrl(24, bgSessions)) }
     val visible = rememberSessionFilter()
     val model = rememberLoad(profile) { runCatching { app.api.obj("/api/model/info") }.getOrNull() }
-    val sys = rememberLoad(poll = 15000) { runCatching { app.api.obj("/api/system/stats", profile = false) }.getOrNull() }
+    val sys = rememberLoad(server, poll = 15000) { runCatching { app.api.obj("/api/system/stats", profile = false) }.getOrNull() }
     val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
     val greet = when (hour) { in 5..11 -> "Good morning"; in 12..16 -> "Good afternoon"; else -> "Good evening" }
 
     Page(
-        title = greet, subtitle = app.api.base.removePrefix("https://").removePrefix("http://"),
+        title = greet, subtitle = auth.label,
         refreshing = status.loading && status.data != null,
         onRefresh = { status.reload(); sessions.reload(); model.reload(); sys.reload() },
         actions = {
+            ServerSwitcher(nav)
             IconButton({ nav.go("settings") }) { Icon(Icons.Outlined.AccountCircle, "Settings", tint = p.ink) }
         },
     ) {
@@ -147,8 +152,8 @@ fun HomeScreen(nav: NavHostController) {
     }
 }
 
-private val SUBAGENT_SOURCES = setOf("subagent", "kanban", "delegate", "delegation")
-private val AUTOMATION_SOURCES = setOf("cron", "tool", "api", "acp")
+private val SUBAGENT_SOURCES = setOf("subagent", "kanban", "delegate", "delegation", "worker")
+private val AUTOMATION_SOURCES = setOf("cron", "tool", "api", "acp", "oneshot", "recovered")
 
 /** Sessions spawned by delegate_task / kanban workers rather than by you. */
 fun JsonObject.isSubagent(): Boolean {
@@ -159,9 +164,14 @@ fun JsonObject.isSubagent(): Boolean {
 }
 fun JsonObject.isAutomation() = s("source").lowercase() in AUTOMATION_SOURCES || (sn("session_id") ?: s("id")).startsWith("cron_")
 
-/** Session list URL. Unless the user opted in, the server drops subagent and cron runs itself. */
+/**
+ * Session list URL. Unless you opted in, the server drops background runs itself. The exclusion list
+ * deliberately leaves out "subagent": per Hermes' subagent_listing_scope, naming other sources without it
+ * keeps delegate children hidden even when the server has sessions.show_subagents turned on.
+ */
+private val HIDDEN_SOURCES = listOf("acp", "cron", "kanban", "oneshot", "tool", "recovered")
 fun sessionsUrl(limit: Int, background: Boolean = app.store.showBackground.value): String =
-    "/api/sessions?limit=$limit&offset=0&order=recent" + if (background) "" else "&exclude_sources=cron"
+    "/api/sessions?limit=$limit&offset=0&order=recent" + if (background) "" else "&exclude_sources=" + HIDDEN_SOURCES.joinToString(",")
 
 /** The user's session-visibility settings, as a predicate. */
 @Composable
@@ -195,4 +205,29 @@ fun sourceIcon(src: String) = when (src.lowercase()) {
     "email" -> Icons.Outlined.Email
     "api", "acp", "tool" -> Icons.Outlined.Code
     else -> Icons.Outlined.Terminal
+}
+
+
+/** Quick switch between your saved Hermes servers. */
+@Composable
+fun ServerSwitcher(nav: NavHostController) {
+    val p = LocalPalette.current
+    val servers by app.store.servers.collectAsState()
+    val active by app.store.activeId.collectAsState()
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton({ open = true }) { Icon(Icons.Outlined.Dns, "Servers", tint = p.ink) }
+        DropdownMenu(open, { open = false }, containerColor = p.sheet) {
+            servers.forEach { sv ->
+                DropdownMenuItem(
+                    { Column { Text(sv.auth.label, color = p.ink); Text(sv.auth.host, color = p.faint, style = MaterialTheme.typography.bodySmall, maxLines = 1) } },
+                    { open = false; if (sv.id != active) switchServer(sv.id) },
+                    leadingIcon = { Icon(if (sv.id == active) Icons.Outlined.CheckCircle else Icons.Outlined.Dns, null, tint = if (sv.id == active) p.good else p.muted) },
+                )
+            }
+            HorizontalDivider(color = p.line)
+            DropdownMenuItem({ Text("Add server") }, { open = false; app.gateway.reset(); app.store.addServer() }, leadingIcon = { Icon(Icons.Outlined.Add, null) })
+            DropdownMenuItem({ Text("Manage servers") }, { open = false; nav.go("settings") }, leadingIcon = { Icon(Icons.Outlined.Settings, null) })
+        }
+    }
 }

@@ -22,7 +22,8 @@ class Api(private val store: Store) {
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private val JSONT = "application/json".toMediaType()
@@ -136,6 +137,34 @@ class Api(private val store: Store) {
     suspend fun put(path: String, body: JsonElement? = null, profile: Boolean = true) = call("PUT", path, body, profile)
     suspend fun patch(path: String, body: JsonElement? = null, profile: Boolean = true) = call("PATCH", path, body, profile)
     suspend fun delete(path: String, body: JsonElement? = null, profile: Boolean = true) = call("DELETE", path, body, profile)
+
+    /** Raw bytes from an authenticated endpoint (file downloads). Returns bytes, mime type and the server's file name. */
+    suspend fun bytes(path: String, maxBytes: Long = 60L * 1024 * 1024): Triple<ByteArray, String, String> = withContext(Dispatchers.IO) {
+        var token = accessToken()
+        repeat(2) { attempt ->
+            val req = Request.Builder().url(base + withProfile(path, true)).get().apply { if (token.isNotBlank()) header("Authorization", "Bearer $token") }.build()
+            http.newCall(req).execute().use { r ->
+                if (r.code == 401 && attempt == 0 && store.auth.value.authRequired && refresh(token)) { token = store.auth.value.accessToken; return@repeat }
+                if (!r.isSuccessful) throw ApiException(r.code, errorDetail(r.body?.string().orEmpty()) ?: "Download failed (${r.code})")
+                val len = r.body?.contentLength() ?: -1
+                if (len > maxBytes) throw ApiException(413, "File is too large to open on the phone")
+                val cd = r.header("Content-Disposition").orEmpty()
+                val name = Regex("filename\\*=UTF-8''([^;]+)").find(cd)?.groupValues?.get(1)?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+                    ?: Regex("filename=\"?([^\";]+)").find(cd)?.groupValues?.get(1) ?: ""
+                return@withContext Triple(r.body!!.bytes(), r.header("Content-Type").orEmpty().substringBefore(';'), name)
+            }
+        }
+        throw AuthExpired()
+    }
+
+    /** Plain GET of a public URL (images Hermes links to). */
+    suspend fun fetchUrl(url: String, maxBytes: Long = 15L * 1024 * 1024): ByteArray = withContext(Dispatchers.IO) {
+        http.newCall(Request.Builder().url(url).get().build()).execute().use { r ->
+            if (!r.isSuccessful) throw ApiException(r.code, "Couldn't load image")
+            if ((r.body?.contentLength() ?: 0) > maxBytes) throw ApiException(413, "Image too large")
+            r.body!!.bytes()
+        }
+    }
 
     suspend fun obj(path: String, profile: Boolean = true): JsonObject = get(path, profile).objOrNull() ?: JsonObject(emptyMap())
     suspend fun arr(path: String, profile: Boolean = true): JsonArray = get(path, profile).arrOrEmpty()

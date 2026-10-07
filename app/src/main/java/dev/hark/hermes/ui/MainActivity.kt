@@ -48,6 +48,18 @@ class MainActivity : ComponentActivity() {
             HermesTheme(theme, preset, Look(glass, motion, ambient)) { Root() }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        app.foreground = true
+        app.gateway.wake()
+        androidx.core.app.NotificationManagerCompat.from(this).cancel(dev.hark.hermes.TurnService.DONE_ID)
+    }
+
+    override fun onPause() {
+        app.foreground = false
+        super.onPause()
+    }
 }
 
 @Composable
@@ -57,6 +69,7 @@ fun Root() {
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(p.bgTop, p.bg, p.bgBottom)))) {
         AmbientGlow()
         if (!auth.isSignedIn) ConnectScreen() else Shell()
+        if (auth.isSignedIn) FileViewerHost()
         SnackbarHost(Toaster.host, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding().padding(bottom = 90.dp)) {
             Snackbar(it, shape = RoundedCornerShape(20.dp), containerColor = p.ink, contentColor = p.accentInk)
         }
@@ -160,6 +173,7 @@ private fun Shell() {
             composable("profiles") { ProfilesScreen(nav) }
             composable("system") { SystemScreen(nav) }
             composable("memory") { MemoryScreen(nav) }
+            composable("files") { FilesScreen(nav) }
             composable("settings") { SettingsScreen(nav) }
         }
         AnimatedVisibility(onTab, Modifier.align(Alignment.TopCenter), enter = fadeIn() + slideInVertically { -it / 2 }, exit = fadeOut() + slideOutVertically { -it / 2 }) {

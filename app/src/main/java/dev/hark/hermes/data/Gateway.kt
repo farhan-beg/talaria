@@ -12,13 +12,24 @@ import okhttp3.WebSocketListener
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+/** One author's emoji on a message (server: message.react / message.reaction). */
+data class Reaction(val emoji: String, val author: String)
+
+internal fun parseReactions(el: JsonElement?): List<Reaction> = runCatching {
+    val obj = when (el) { is JsonObject -> el; is JsonPrimitive -> el.contentOrNull?.let { Jsonx.parseToJsonElement(it) as? JsonObject }; else -> null }
+    val arr = (obj?.get("reactions") ?: (el as? JsonArray)) as? JsonArray ?: return emptyList()
+    arr.mapNotNull { r -> (r as? JsonObject)?.let { o -> o.sn("emoji")?.takeIf { it.isNotBlank() }?.let { Reaction(it, o.sn("author") ?: "user") } } }
+}.getOrDefault(emptyList())
+
 sealed interface ChatItem {
     val key: String
-    data class User(override val key: String, val text: String, val raw: String = text, val rowId: Long? = null, val ordinal: Int = -1) : ChatItem
+    data class User(override val key: String, val text: String, val raw: String = text, val rowId: Long? = null, val ordinal: Int = -1, val files: List<Attachment> = emptyList(), val reactions: List<Reaction> = emptyList()) : ChatItem
     data class Assistant(
         override val key: String, val text: String, val reasoning: String = "", val streaming: Boolean = false,
         // nerd stats: wall-clock marks (ms) and how much streamed
         val startMs: Long = 0, val firstMs: Long = 0, val endMs: Long = 0, val chars: Int = 0, val outTokens: Long = 0,
+        // durable messages.id (reactions address it) and the Tapback-style reactions on it
+        val rowId: Long? = null, val reactions: List<Reaction> = emptyList(),
     ) : ChatItem {
         /** Output tokens: exact when the server reported usage, otherwise ~4 chars per token. */
         val tokens: Long get() = if (outTokens > 0) outTokens else (chars / 4).toLong()
@@ -30,16 +41,16 @@ sealed interface ChatItem {
             return if (secs < 0.25) 0.0 else tokens / secs
         }
     }
-    data class Tool(override val key: String, val name: String, val preview: String, val done: Boolean, val summary: String = "", val duration: Double = 0.0) : ChatItem
+    data class Tool(override val key: String, val name: String, val preview: String, val done: Boolean, val summary: String = "", val duration: Double = 0.0, val startMs: Long = 0, val endMs: Long = 0) : ChatItem
     data class Notice(override val key: String, val text: String, val error: Boolean = false) : ChatItem
     /** Output of a slash command, shown as a terminal-style card. */
     data class Output(override val key: String, val command: String, val text: String) : ChatItem
 }
 
 /** A file staged into the session before the next prompt. Images ride the turn; files become @file refs. */
-data class Attachment(val name: String, val kind: String, val path: String = "", val ref: String = "", val pages: Int = 0)
+data class Attachment(val name: String, val kind: String, val path: String = "", val ref: String = "", val pages: Int = 0, val thumb: String = "")
 
-data class SlashHint(val text: String, val display: String, val meta: String, val skill: Boolean)
+data class SlashHint(val text: String, val display: String, val meta: String, val skill: Boolean, val usage: Long = 0)
 
 data class ServerAsk(val id: JsonElement, val method: String, val params: JsonObject)
 
@@ -57,6 +68,13 @@ class Gateway(private val api: Api, private val store: Store) {
     val connError = MutableStateFlow<String?>(null)
     val items = MutableStateFlow<List<ChatItem>>(emptyList())
     val busy = MutableStateFlow(false)
+    /** How the last turn ended, for the "reply ready" notification. */
+    data class Outcome(val status: String, val text: String, val at: Long)
+    val lastOutcome = MutableStateFlow<Outcome?>(null)
+    /** Calls that look the chat up in a profile's own store; without `profile` a non-default profile's chat isn't found. */
+    private val PROFILE_AWARE = setOf("session.create", "session.resume", "session.history", "message.react", "config.get", "config.set",
+        "complete.path", "complete.slash", "commands.catalog", "session.title", "session.usage", "session.compress")
+    private val LIVE_EVENTS = setOf("message.delta", "reasoning.delta", "thinking.delta", "tool.generating", "tool.start", "subagent.progress", "status.update")
     val status = MutableStateFlow("")
     val title = MutableStateFlow("New chat")
     val model = MutableStateFlow("")
@@ -72,7 +90,46 @@ class Gateway(private val api: Api, private val store: Store) {
     private var userSeen = 0
     private fun k(p: String) = "$p-${seq++}"
 
+    // ── resilience: keep the socket alive across network switches and backgrounding ──
+    @Volatile private var wanted = false
+    @Volatile private var attempt = 0
+    private var retryJob: Job? = null
+    @Volatile private var lastFrameAt = 0L
+    val reconnecting = MutableStateFlow(false)
+
+    /** Watch the network so a new Wi-Fi/mobile link reconnects immediately instead of waiting out a backoff. */
+    fun watchNetwork(ctx: android.content.Context) {
+        val cm = ctx.getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) { if (wanted && conn.value != Conn.Ready) reconnectNow() }
+                override fun onLost(network: android.net.Network) { if (wanted) ws?.cancel() }
+            })
+        }
+    }
+
+    /** Called when the app comes back to the foreground: verify the socket is really alive. */
+    fun wake() {
+        if (!wanted) return
+        if (conn.value != Conn.Ready) { reconnectNow(); return }
+        scope.launch {
+            val ok = runCatching { withTimeout(5_000) { rpcRaw("ping", JsonObject(emptyMap())) } }.isSuccess
+            if (!ok) { ws?.cancel() }
+        }
+    }
+
+    private fun reconnectNow() { retryJob?.cancel(); attempt = 0; conn.value = Conn.Idle; connect() }
+
+    private fun scheduleRetry() {
+        retryJob?.cancel()
+        val delayMs = (500L shl attempt.coerceAtMost(5)).coerceAtMost(15_000L)
+        attempt++
+        reconnecting.value = true
+        retryJob = scope.launch { delay(delayMs); if (wanted && conn.value != Conn.Ready) { conn.value = Conn.Idle; connect() } }
+    }
+
     fun connect() {
+        wanted = true
         if (conn.value == Conn.Connecting || conn.value == Conn.Ready) return
         conn.value = Conn.Connecting
         connError.value = null
@@ -85,17 +142,30 @@ class Gateway(private val api: Api, private val store: Store) {
     }
 
     fun disconnect() {
+        wanted = false; retryJob?.cancel(); reconnecting.value = false
         ws?.close(1000, "bye"); ws = null
         conn.value = Conn.Idle
     }
 
     private inner class Listener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            val wasReconnect = reconnecting.value || attempt > 0
             conn.value = Conn.Ready
+            connError.value = null
+            attempt = 0
+            lastFrameAt = System.currentTimeMillis()
             readyGate.complete(Unit)
-            scope.launch { runCatching { rpc("client.capabilities", jsonOf("server_requests" to true)) } }
+            scope.launch {
+                runCatching { rpc("client.capabilities", jsonOf("server_requests" to true)) }
+                // re-attach to the chat we were in so streaming and history pick up where they left off
+                if (wasReconnect && storedSid.isNotBlank()) runCatching {
+                    applySnapshot(resumeRpc(storedSid))
+                }
+                reconnecting.value = false
+            }
         }
         override fun onMessage(webSocket: WebSocket, text: String) {
+            lastFrameAt = System.currentTimeMillis()
             text.split('\n').filter { it.isNotBlank() }.forEach { line ->
                 runCatching { handle(Jsonx.parseToJsonElement(line).jsonObject) }
             }
@@ -110,8 +180,17 @@ class Gateway(private val api: Api, private val store: Store) {
     private fun dropped(err: String?) {
         if (ws == null && conn.value == Conn.Idle) return
         ws = null
-        conn.value = if (err != null) Conn.Failed else Conn.Idle
-        connError.value = err
+        val auth = err == "Sign-in expired"
+        // transient drops retry quietly; only auth failures or a long outage surface as an error
+        if (wanted && !auth && attempt < 8) {
+            conn.value = Conn.Connecting
+            connError.value = null
+            scheduleRetry()
+        } else {
+            conn.value = if (err != null) Conn.Failed else Conn.Idle
+            connError.value = if (err != null && !auth) "Can't reach Hermes" else err
+            reconnecting.value = false
+        }
         if (!readyGate.isCompleted) readyGate.completeExceptionally(java.io.IOException(err ?: "closed"))
         pending.values.forEach { it.completeExceptionally(java.io.IOException(err ?: "Connection closed")) }
         pending.clear()
@@ -120,16 +199,33 @@ class Gateway(private val api: Api, private val store: Store) {
     }
 
     private suspend fun ensureReady() {
-        if (conn.value != Conn.Ready) connect()
-        withTimeout(20_000) { readyGate.await() }
+        if (conn.value == Conn.Failed) { attempt = 0; conn.value = Conn.Idle }
+        if (conn.value != Conn.Ready && conn.value != Conn.Connecting) connect()
+        withTimeout(25_000) {
+            while (true) {
+                val gate = readyGate
+                try { gate.await(); return@withTimeout } catch (e: Exception) { if (!wanted) throw e; delay(300) }
+            }
+        }
     }
 
+    /** One retry across a reconnect for calls that are safe to repeat. */
     suspend fun rpc(method: String, params: JsonObject = JsonObject(emptyMap())): JsonObject {
+        val safe = method != "prompt.submit" && method != "slash.exec" && method != "command.dispatch"
+        return try { rpcRaw(method, params) } catch (e: java.io.IOException) {
+            if (!safe || !wanted) throw e
+            delay(400); rpcRaw(method, params)
+        }
+    }
+
+    private suspend fun rpcRaw(method: String, params: JsonObject): JsonObject {
         ensureReady()
         val id = "m${ids.getAndIncrement()}"
         val d = CompletableDeferred<JsonObject>()
         pending[id] = d
-        val frame = jsonOf("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to params)
+        val prof = store.profile.value
+        val sent = if (prof.isNotBlank() && method in PROFILE_AWARE && params["profile"] == null) JsonObject(params + ("profile" to JsonPrimitive(prof))) else params
+        val frame = jsonOf("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to sent)
         if (ws?.send(frame.toString()) != true) { pending.remove(id); throw java.io.IOException("Not connected") }
         return withTimeout(120_000) { d.await() }
     }
@@ -160,6 +256,15 @@ class Gateway(private val api: Api, private val store: Store) {
         val pl = p.o("payload") ?: JsonObject(emptyMap())
         when (type) {
             "gateway.ready" -> {}
+            "approval.cancelled" -> {
+                val ids = pl.a("request_ids").strs().toSet()
+                asks.update { l -> l.filterNot { it.method == "approval" && ((it.id as? JsonPrimitive)?.content in ids || it.params.s("request_id") in ids) } }
+            }
+            "session.reclaimed" -> if (mine(sid)) {
+                // the server dropped our live session (e.g. idle while backgrounded); pick the chat back up
+                val stored = pl.sn("stored_session_id") ?: storedSid
+                if (stored.isNotBlank()) scope.launch { runCatching { storedSid = stored; applySnapshot(resumeRpc(stored)) } }
+            }
             "request.cancel" -> { val id = pl.s("id"); asks.update { l -> l.filterNot { (it.id as? JsonPrimitive)?.content == id } } }
             "skin.changed" -> {}
             else -> if (mine(sid)) onSessionEvent(type, pl)
@@ -168,12 +273,16 @@ class Gateway(private val api: Api, private val store: Store) {
 
     private fun lastStreaming(): Int = items.value.indexOfLast { it is ChatItem.Assistant && it.streaming }
 
-    private var turnStart = 0L
+    var turnStart = 0L
+        private set
     private var usageOutAtStart = 0L
     private fun outOf(u: JsonObject?): Long = u?.let { maxOf(it.l("output"), it.l("output_tokens"), it.l("completion_tokens")) } ?: 0L
     private fun now() = System.currentTimeMillis()
     private fun ChatItem.Assistant.ended() = if (streaming || endMs == 0L) copy(streaming = false, endMs = now()) else copy(streaming = false)
     private fun ChatItem.Assistant.got(t: String) = copy(firstMs = if (firstMs == 0L && t.isNotEmpty()) now() else firstMs, chars = chars + t.length)
+
+    /** A reply that arrived whole (no deltas): stamp it so the turn still gets stats. */
+    private fun whole(t: String) = now().let { n -> ChatItem.Assistant(k("a"), t, startMs = if (turnStart > 0) turnStart else n, firstMs = n, endMs = n, chars = t.length) }
 
     private fun ensureAssistant(): Int {
         val i = lastStreaming()
@@ -185,16 +294,22 @@ class Gateway(private val api: Api, private val store: Store) {
     private fun mutate(i: Int, f: (ChatItem) -> ChatItem) = items.update { l -> l.toMutableList().also { if (i in it.indices) it[i] = f(it[i]) } }
 
     private fun onSessionEvent(type: String, pl: JsonObject) {
+        // any sign of life from a running turn means it's still running (keeps Stop available across multi-step turns)
+        if (type in LIVE_EVENTS && !busy.value) { busy.value = true; if (turnStart == 0L) turnStart = now() }
         when (type) {
             "btw.complete" -> items.update { it + ChatItem.Output(k("o"), "btw · " + pl.s("question").take(60), pl.s("text")) }
             "message.start" -> { busy.value = true; turnStart = now(); usageOutAtStart = outOf(usage.value); ensureAssistant() }
             "message.delta" -> { val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(text = it.text + t) } }
             "reasoning.delta", "thinking.delta" -> { val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(reasoning = it.reasoning + t) } }
+            "reasoning.available" -> {
+                // providers that don't stream thinking hand it over whole
+                val t = pl.s("text"); if (t.isNotBlank()) { val i = ensureAssistant(); mutate(i) { a -> (a as ChatItem.Assistant).let { if (it.reasoning.isBlank()) it.copy(reasoning = t) else it } } }
+            }
             "message.interim" -> {
                 val t = pl.s("text")
                 val i = lastStreaming()
                 if (i >= 0) mutate(i) { a -> (a as ChatItem.Assistant).ended().let { it.copy(text = it.text.ifBlank { t }) } }
-                else if (t.isNotBlank()) items.update { it + ChatItem.Assistant(k("a"), t) }
+                else if (t.isNotBlank()) items.update { it + whole(t) }
             }
             "tool.generating" -> status.value = "Preparing ${pl.s("name")}…"
             "tool.start" -> {
@@ -202,41 +317,63 @@ class Gateway(private val api: Api, private val store: Store) {
                 if (i >= 0) mutate(i) { (it as ChatItem.Assistant).ended() }
                 items.update { l ->
                     l.filterNot { it is ChatItem.Assistant && it.text.isBlank() && it.reasoning.isBlank() } +
-                        ChatItem.Tool("t-" + pl.s("tool_id"), pl.s("name"), pl.s("context").ifBlank { pl.s("preview").ifBlank { pl.s("args_text") } }, false)
+                        ChatItem.Tool("t-" + pl.s("tool_id"), pl.s("name"), pl.s("context").ifBlank { pl.s("preview").ifBlank { pl.s("args_text") } }, false, startMs = now())
                 }
                 status.value = ""
             }
             "tool.complete" -> {
                 val key = "t-" + pl.s("tool_id")
-                items.update { l -> l.map { if (it is ChatItem.Tool && it.key == key) it.copy(done = true, summary = pl.s("summary"), duration = pl.d("duration_s")) else it } }
+                items.update { l -> l.map { if (it is ChatItem.Tool && it.key == key) it.copy(done = true, summary = pl.s("summary"), duration = pl.d("duration_s"), endMs = now()) else it } }
             }
             "status.update" -> status.value = pl.s("text")
+            "message.reaction" -> applyReactions(pl.l("row_id"), parseReactions(pl["reactions"]), pl.s("role"))
             "session.usage" -> usage.value = pl.o("usage")
             "session.title" -> title.value = pl.s("title").ifBlank { title.value }
-            "session.info" -> { pl.sn("model")?.let { model.value = it }; pl["yolo"]?.let { yolo.value = pl.b("yolo") } }
+            "session.info" -> { applyInfo(pl) }
             "message.complete" -> {
                 val text = pl["text"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: ""
                 val i = lastStreaming()
                 val reused = pl.b("response_reused")
                 pl.o("usage")?.let { usage.value = it }
                 val turnOut = (outOf(usage.value) - usageOutAtStart).coerceAtLeast(0)
-                if (i >= 0) mutate(i) { a -> (a as ChatItem.Assistant).ended().let { it.copy(text = if (it.text.isBlank() && !reused) text else it.text) } }
-                // credit the turn's exact output tokens to its last reply (single-reply turns are exact)
-                if (turnOut > 0) {
-                    val j = items.value.indexOfLast { it is ChatItem.Assistant }
-                    if (j >= 0) mutate(j) { a -> (a as ChatItem.Assistant).let { if (it.startMs >= turnStart && it.firstMs > 0) it.copy(outTokens = turnOut) else it } }
+                val why = pl.sn("reasoning").orEmpty()
+                if (i >= 0) mutate(i) { a -> (a as ChatItem.Assistant).ended().let { it.copy(text = if (it.text.isBlank() && !reused) text else it.text, reasoning = it.reasoning.ifBlank { why }) } }
+                if (i < 0 && text.isNotBlank() && !reused && items.value.lastOrNull().let { it !is ChatItem.Assistant || it.text != text }) {
+                    items.update { it + whole(text) }
                 }
-                else if (text.isNotBlank() && !reused && items.value.lastOrNull().let { it !is ChatItem.Assistant || it.text != text }) {
-                    items.update { it + ChatItem.Assistant(k("a"), text) }
-                }
+                // every reply in this turn carries the turn's exact output tokens (stats aggregate per turn)
+                val turnFrom = items.value.indexOfLast { it is ChatItem.User } + 1
+                items.update { l -> l.mapIndexed { n, it ->
+                    if (n >= turnFrom && it is ChatItem.Assistant) {
+                        val a = if (turnOut > 0) it.copy(outTokens = turnOut) else it
+                        (if (a.firstMs == 0L && a.text.isNotBlank()) a.copy(startMs = turnStart.takeIf { s -> s > 0 } ?: now(), firstMs = now(), endMs = now()) else a)
+                    } else it
+                } }
+                items.value.drop(turnFrom).filterIsInstance<ChatItem.Assistant>().forEach { StatsCache.save(it) }
                 items.update { l -> l.filterNot { it is ChatItem.Assistant && it.text.isBlank() && it.reasoning.isBlank() } }
+                // durable ids for this turn, straight from the server (reactions address these)
+                pl.o("persisted_turn")?.let { pt ->
+                    pt["final_assistant_row_id"]?.let { pt.l("final_assistant_row_id") }?.takeIf { it > 0 }?.let { row ->
+                        items.update { l -> val j = l.indexOfLast { it is ChatItem.Assistant && it.text.isNotBlank() }
+                            if (j < 0) l else l.toMutableList().also { x -> x[j] = (x[j] as ChatItem.Assistant).copy(rowId = row) } }
+                    }
+                    pt["user_row_id"]?.let { pt.l("user_row_id") }?.takeIf { it > 0 }?.let { stampUserRow(it) }
+                }
                 val st = pl.s("status")
-                if (st == "error") items.update { it + ChatItem.Notice(k("n"), pl.sn("error") ?: pl.sn("failure_reason") ?: "The turn failed", true) }
+                if (st == "error") {
+                    val es = pl.o("error_surface")
+                    val until = es?.sn("resets_at")?.let { " Try again after ${prettyReset(it)}." }.orEmpty()
+                    val retry = if (es?.b("retryable") == true || pl.b("recoverable")) " You can retry." else ""
+                    items.update { it + ChatItem.Notice(k("n"), (pl.sn("error") ?: pl.sn("failure_reason") ?: "The turn failed") + until.ifBlank { retry }, true) }
+                }
                 if (st == "interrupted") items.update { it + ChatItem.Notice(k("n"), "Stopped") }
                 pl.sn("warning")?.let { w -> items.update { it + ChatItem.Notice(k("n"), w) } }
                 pl.o("usage")?.let { usage.value = it }
+                lastOutcome.value = Outcome(st.ifBlank { "complete" }, items.value.lastOrNull { it is ChatItem.Assistant && it.text.isNotBlank() }.let { (it as? ChatItem.Assistant)?.text.orEmpty() }, now())
                 busy.value = false
                 status.value = ""
+                turnStart = 0L
+                if (items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() }) scope.launch { runCatching { syncRowIds() } }
             }
             "error" -> { items.update { it + ChatItem.Notice(k("n"), pl.s("message"), true) }; busy.value = false; status.value = "" }
         }
@@ -247,7 +384,7 @@ class Gateway(private val api: Api, private val store: Store) {
     private fun applySnapshot(r: JsonObject) {
         runtimeSid = r.s("session_id")
         storedSid = r.sn("stored_session_id") ?: storedSid
-        r.o("info")?.let { info -> info.sn("model")?.let { model.value = it }; info["yolo"]?.let { yolo.value = info.b("yolo") } }
+        r.o("info")?.let { applyInfo(it) }
         val list = mutableListOf<ChatItem>()
         var ord = 0
         r.a("messages").objs().forEach { m ->
@@ -255,15 +392,144 @@ class Gateway(private val api: Api, private val store: Store) {
             when (m.s("role")) {
                 "user" -> {
                     val o = ord++
-                    if (m.s("display_kind") != "hidden" && txt.isNotBlank()) list += ChatItem.User(k("u"), txt, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, o)
+                    if (m.s("display_kind") != "hidden" && txt.isNotBlank()) list += ChatItem.User(k("u"), txt, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, o, reactions = parseReactions(m["display_metadata"]))
                 }
-                "assistant" -> if (txt.isNotBlank()) list += ChatItem.Assistant(k("a"), txt, m.s("reasoning"))
+                "assistant" -> if (txt.isNotBlank()) list += StatsCache.restore(ChatItem.Assistant(k("a"), txt, m.s("reasoning"),
+                    rowId = m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, reactions = parseReactions(m["display_metadata"])))
                 "tool" -> list += ChatItem.Tool(k("t"), m.s("name").ifBlank { "tool" }, m.s("context"), true)
                 "system" -> {}
             }
         }
+        // a turn still running on the server: show what it has said so far and keep streaming into it
+        val running = r.b("running") || r.o("info")?.b("running") == true
+        r.o("inflight")?.let { inf ->
+            val partial = inf.s("assistant")
+            if (running && partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = inf.b("streaming") || running, startMs = now())
+            inf.sn("status")?.let { status.value = it }
+        }
         items.value = list
         userSeen = ord
+        if (running) { busy.value = true; if (turnStart == 0L) turnStart = now() }
+        // questions that were waiting for us while we were away
+        val waiting = mutableListOf<ServerAsk>()
+        r.a("open_requests").objs().forEach { q -> q["id"]?.let { waiting += ServerAsk(it, q.s("method"), q.o("params") ?: JsonObject(emptyMap())) } }
+        r.o("pending_approval")?.let { pa ->
+            val rid = pa.s("request_id")
+            if (waiting.none { it.method == "approval" }) waiting += ServerAsk(JsonPrimitive("resume-approval:$rid"), "approval", pa)
+        }
+        if (waiting.isNotEmpty()) asks.update { l -> l + waiting.filter { w -> l.none { it.id == w.id } } }
+    }
+
+    private fun stampUserRow(row: Long) = items.update { l ->
+        val j = l.indexOfLast { it is ChatItem.User }
+        if (j < 0 || (l[j] as ChatItem.User).rowId != null) l else l.toMutableList().also { x -> x[j] = (x[j] as ChatItem.User).copy(rowId = row) }
+    }
+
+    private fun prettyReset(v: String): String = runCatching {
+        val ms = v.toDoubleOrNull()?.let { if (it < 1e12) (it * 1000).toLong() else it.toLong() } ?: java.time.Instant.parse(v).toEpochMilli()
+        java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date(ms))
+    }.getOrDefault(v)
+
+    /** model / yolo / speed from session.info or a snapshot's info. */
+    private fun applyInfo(pl: JsonObject) {
+        pl.sn("model")?.let { if (it.isNotBlank()) model.value = it }
+        pl["yolo"]?.let { yolo.value = pl.b("yolo") }
+        fastFromInfo(pl)?.let { fast.value = it }
+        pl.sn("reasoning_effort")?.let { if (it.isNotBlank()) reasoning.value = it }
+        // the agent is built now: carry your saved speed into this chat once (settings sent before the build are dropped)
+        val built = pl.sn("model").orEmpty().isNotBlank() && !pl.b("lazy")
+        if (built && fastAssertFor != runtimeSid && runtimeSid.isNotBlank()) {
+            fastAssertFor = runtimeSid
+            val tier = pl.sn("service_tier")?.lowercase().orEmpty()
+            if (store.fastPref.value && tier != "priority" && tier != "ultrafast") {
+                val sid = runtimeSid
+                scope.launch { runCatching { rpc("config.set", jsonOf("session_id" to sid, "key" to "fast", "value" to "fast")).sn("value")?.let { if (sid == runtimeSid) fast.value = it != "normal" } } }
+            }
+        }
+    }
+    private var fastAssertFor = ""
+
+    /** Resume that builds the agent up front (so per-chat settings stick), falling back for older servers. */
+    private suspend fun resumeRpc(stored: String): JsonObject {
+        fastAssertFor = ""
+        return try { rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "inline_images" to false, "eager_build" to true)) }
+        catch (e: java.io.IOException) {
+            if (!e.message.orEmpty().contains("eager_build")) throw e
+            rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "inline_images" to false))
+        }
+    }
+
+    private fun applyReactions(row: Long, rs: List<Reaction>, role: String) {
+        if (row <= 0) return
+        items.update { l ->
+            var hit = false
+            val m = l.map {
+                when {
+                    it is ChatItem.Assistant && it.rowId == row -> { hit = true; it.copy(reactions = rs) }
+                    it is ChatItem.User && it.rowId == row -> { hit = true; it.copy(reactions = rs) }
+                    else -> it
+                }
+            }
+            if (hit) m else {
+                // a live row we haven't learned the id of yet: the newest message of that role
+                val i = m.indexOfLast { if (role == "user") it is ChatItem.User else it is ChatItem.Assistant }
+                if (i < 0) m else m.toMutableList().also { x ->
+                    x[i] = when (val it = x[i]) { is ChatItem.Assistant -> it.copy(rowId = row, reactions = rs); is ChatItem.User -> it.copy(rowId = row, reactions = rs); else -> it }
+                }
+            }
+        }
+    }
+
+    /** Learns durable row ids for messages streamed this session (by matching text), so reactions can address them. */
+    private suspend fun syncRowIds() {
+        if (runtimeSid.isBlank()) return
+        val hist = rpc("session.history", jsonOf("session_id" to runtimeSid)).a("messages").objs()
+        val asst = hist.filter { it.s("role") == "assistant" && it["row_id"] != null }.map { it.s("text").trim() to it }.toMutableList()
+        items.update { l -> l.map { item ->
+            if (item is ChatItem.Assistant && item.rowId == null && item.text.isNotBlank()) {
+                val idx = asst.indexOfFirst { it.first == item.text.trim() }
+                if (idx >= 0) { val m = asst.removeAt(idx).second; item.copy(rowId = m.l("row_id"), reactions = parseReactions(m["display_metadata"]).ifEmpty { item.reactions }) } else item
+            } else item
+        } }
+    }
+
+    /** Your Tapback on a message: one per author, the same emoji again (or null) takes it back. */
+    suspend fun react(key: String, emoji: String?) {
+        val target = items.value.firstOrNull { it.key == key } ?: return
+        val (row, role, before) = when (target) {
+            is ChatItem.Assistant -> Triple(target.rowId, "assistant", target.reactions)
+            is ChatItem.User -> Triple(target.rowId, "user", target.reactions)
+            else -> return
+        }
+        val mineBefore = before.firstOrNull { it.author == "user" }?.emoji
+        val next = before.filter { it.author != "user" } + (if (emoji != null && emoji != mineBefore) listOf(Reaction(emoji, "user")) else emptyList())
+        fun put(rs: List<Reaction>, id: Long? = null) = items.update { l -> l.map {
+            if (it.key != key) it else when (it) { is ChatItem.Assistant -> it.copy(reactions = rs, rowId = id ?: it.rowId); is ChatItem.User -> it.copy(reactions = rs, rowId = id ?: it.rowId); else -> it }
+        } }
+        put(next)   // optimistic, then the server's list wins
+        if (row == null) runCatching { syncRowIds() }
+        val fresh = items.value.firstOrNull { it.key == key }.let { (it as? ChatItem.Assistant)?.rowId ?: (it as? ChatItem.User)?.rowId }
+        val isNewest = items.value.indexOfLast { if (role == "user") it is ChatItem.User else it is ChatItem.Assistant } == items.value.indexOfFirst { it.key == key }
+        try {
+            if (fresh == null && !isNewest) throw IllegalStateException("This reply isn't saved yet. Try again in a moment.")
+            val r = rpc("message.react", buildJsonObject {
+                put("session_id", runtimeSid)
+                if (fresh != null) put("row_id", fresh) else put("newest_role", role)
+                put("emoji", if (emoji == null || emoji == mineBefore) JsonNull else JsonPrimitive(emoji))
+                put("author", "user")
+            })
+            put(parseReactions(r["reactions"]), r.l("row_id").takeIf { it > 0 })
+        } catch (e: Exception) { put(before); throw e }
+    }
+
+    /** @-reference completion for files, folders and agent profiles on Hermes' machine. */
+    suspend fun completePath(word: String): List<SlashHint> {
+        val r = rpc("complete.path", buildJsonObject {
+            put("word", word)
+            if (runtimeSid.isNotBlank()) put("session_id", runtimeSid)
+            store.profile.value.takeIf { it.isNotBlank() }?.let { put("profile", it) }
+        })
+        return r.a("items").objs().map { SlashHint(it.s("text"), it.sn("display") ?: it.s("text"), it.s("meta"), false) }
     }
 
     suspend fun newChat() {
@@ -271,9 +537,13 @@ class Gateway(private val api: Api, private val store: Store) {
         try {
             items.value = emptyList(); title.value = "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
             val p = store.profile.value
-            val r = rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null }))
+            fastAssertFor = ""
+            // the speed rides on create itself; a config.set before the agent is built would be dropped
+            val r = try { rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null }, "fast" to (if (store.fastPref.value) true else null))) }
+                catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null })) }
             storedSid = r.s("stored_session_id")
             applySnapshot(r)
+            runCatching { loadRunSettings() }
         } finally { loadingSession.value = false }
     }
 
@@ -282,8 +552,8 @@ class Gateway(private val api: Api, private val store: Store) {
         try {
             items.value = emptyList(); title.value = t?.ifBlank { null } ?: "Chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
             storedSid = stored
-            val r = rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "inline_images" to false))
-            applySnapshot(r)
+            applySnapshot(resumeRpc(stored))
+            runCatching { loadRunSettings() }
         } finally { loadingSession.value = false }
     }
 
@@ -297,7 +567,7 @@ class Gateway(private val api: Api, private val store: Store) {
         val wasBusy = busy.value
         val key = k("u")
         val ord = userSeen++
-        items.update { it + ChatItem.User(key, shown.ifBlank { body }, body, null, ord) }
+        items.update { it + ChatItem.User(key, if (staged.isNotEmpty()) text else shown.ifBlank { body }, body, null, ord, staged) }
         busy.value = true
         try {
             val r = rpc("prompt.submit", jsonOf("session_id" to runtimeSid, "text" to body))
@@ -312,7 +582,7 @@ class Gateway(private val api: Api, private val store: Store) {
 
     // ── attachments ──────────────────────────────────────────────────────────
 
-    suspend fun attach(bytes: ByteArray, name: String, mime: String) {
+    suspend fun attach(bytes: ByteArray, name: String, mime: String, thumb: String = "") {
         if (runtimeSid.isBlank()) newChat()
         val b64 = java.util.Base64.getEncoder().encodeToString(bytes)
         val isImage = mime.startsWith("image/")
@@ -328,7 +598,7 @@ class Gateway(private val api: Api, private val store: Store) {
             } catch (e: Exception) { stageFile(b64, name, mime) }  // no poppler on the host: hand over the raw file
             else -> stageFile(b64, name, mime)
         }
-        attachments.update { it + a }
+        attachments.update { it + a.copy(thumb = thumb) }
     }
 
     private suspend fun stageFile(b64: String, name: String, mime: String): Attachment {
@@ -362,6 +632,49 @@ class Gateway(private val api: Api, private val store: Store) {
     }
 
     // ── slash commands ───────────────────────────────────────────────────────
+
+    /** Every command and skill, fetched once per connection and filtered on-device as you type. */
+    val catalog = MutableStateFlow<List<SlashHint>>(emptyList())
+    suspend fun loadCatalog(force: Boolean = false) {
+        if (catalog.value.isNotEmpty() && !force) return
+        val r = rpc("commands.catalog", jsonOf("session_id" to runtimeSid.ifBlank { null }, "profile" to store.profile.value.ifBlank { null }))
+        val skills = r.o("skills")?.keys ?: emptySet()
+        val usage = r.o("skills")?.mapValues { (it.value as? JsonObject)?.l("usage") ?: 0L } ?: emptyMap()
+        catalog.value = r.a("pairs").mapNotNull { (it as? JsonArray)?.takeIf { a -> a.size >= 1 } }.map { a ->
+            val name = (a[0] as JsonPrimitive).content.let { if (it.startsWith("/")) it else "/$it" }
+            val desc = (a.getOrNull(1) as? JsonPrimitive)?.contentOrNull.orEmpty()
+            SlashHint(name, name, desc, name in skills || name.removePrefix("/") in skills, usage[name] ?: usage[name.removePrefix("/")] ?: 0)
+        }.distinctBy { it.text }
+    }
+
+    /** Fold a message into the running turn right after its current step. */
+    suspend fun steer(text: String) {
+        val r = rpc("session.steer", jsonOf("session_id" to runtimeSid, "text" to text))
+        if (r.s("status") == "rejected") throw IllegalStateException("Hermes couldn't steer this turn — queue it instead")
+        items.update { it + ChatItem.Notice(k("n"), "↪ Steered: " + text.take(120)) }
+    }
+
+    /** Messages waiting to go out once the current turn finishes. */
+    val queued = MutableStateFlow<List<String>>(emptyList())
+    fun enqueue(text: String) { queued.update { it + text } }
+    fun unqueue(i: Int) { queued.update { l -> l.toMutableList().also { if (i in it.indices) it.removeAt(i) } } }
+    init {
+        scope.launch {
+            lastOutcome.collect { o ->
+                if (o == null || o.status == "interrupted") return@collect   // a deliberate stop holds the queue
+                delay(250)
+                val next = queued.value.firstOrNull() ?: return@collect
+                if (busy.value) return@collect
+                queued.update { it.drop(1) }
+                send(next)
+            }
+        }
+    }
+    suspend fun sendQueuedNow(i: Int) {
+        val t = queued.value.getOrNull(i) ?: return
+        unqueue(i)
+        if (busy.value) steer(t) else send(t)
+    }
 
     /** Completions for the text being typed; second value is where the replacement starts. */
     suspend fun completeSlash(text: String): Pair<List<SlashHint>, Int> {
@@ -469,8 +782,46 @@ class Gateway(private val api: Api, private val store: Store) {
         return msg
     }
 
-    suspend fun setSessionFlag(key: String, value: String) {
-        rpc("config.set", jsonOf("session_id" to runtimeSid, "key" to key, "value" to value))
+    suspend fun setSessionFlag(key: String, value: String): String {
+        // without a live session the server would write the global config instead, and the next read
+        // (session-scoped) would flip the switch straight back — so make sure this chat exists first
+        if (runtimeSid.isBlank()) newChat()
+        if (key == "fast") store.set(store.fastPref, "fast_pref", value != "normal")
+        val before = if (key == "fast") fast.value else null
+        if (key == "fast") fast.value = value != "normal"   // optimistic, reverted on failure
+        try {
+            val r = rpc("config.set", jsonOf("session_id" to runtimeSid, "key" to key, "value" to value))
+            val v = r.sn("value") ?: value
+            when (key) { "reasoning" -> reasoning.value = v; "fast" -> fast.value = v != "normal" }
+            return v
+        } catch (e: Exception) {
+            before?.let { fast.value = it }
+            val m = e.message.orEmpty()
+            if (key == "fast" && m.contains("not available", true)) throw IllegalStateException("This model has no faster tier to switch to — it already runs at its only speed.")
+            throw e
+        }
+    }
+
+    /** Pulls this chat's thinking level and speed so the picker opens on the truth. */
+    suspend fun loadRunSettings() {
+        val sid = runtimeSid
+        fun params(key: String) = if (sid.isBlank()) jsonOf("key" to key) else jsonOf("session_id" to sid, "key" to key)
+        runCatching { rpc("config.get", params("reasoning")).sn("value")?.let { reasoning.value = it } }
+        // speed comes from session.info frames (and is re-applied once the agent is built), not a read-back here:
+        // reading it mid-build answers "normal" and would flip your switch off
+    }
+    val reasoning = MutableStateFlow("")
+    val fast = MutableStateFlow(false)
+
+    /**
+     * session.info carries `fast` (does the priority tier actually apply) and `service_tier`.
+     * Mid-turn info frames can omit or blank the tier, so only a definite answer changes the toggle.
+     */
+    private fun fastFromInfo(pl: JsonObject): Boolean? {
+        val t = pl.sn("service_tier")?.trim()?.lowercase()
+        if (!t.isNullOrEmpty()) return t == "priority" || t == "ultrafast" || t == "fast"
+        // no tier named in this frame: keep what we know rather than flipping off
+        return if (t == null) (pl["fast"] as? JsonPrimitive)?.booleanOrNull?.takeIf { it } else null
     }
 
     suspend fun subagents(): List<JsonObject> =
@@ -486,9 +837,27 @@ class Gateway(private val api: Api, private val store: Store) {
 
     val sessionId get() = runtimeSid
 
-    suspend fun interrupt() { runCatching { rpc("session.interrupt", jsonOf("session_id" to runtimeSid)) } }
+    suspend fun interrupt(): Boolean {
+        status.value = "Stopping…"
+        val ok = runCatching { rpc("session.interrupt", jsonOf("session_id" to runtimeSid)) }.isSuccess
+        // if the server never sends message.complete (e.g. it was already idle), don't leave Stop stuck on
+        scope.launch {
+            delay(6_000)
+            if (busy.value && status.value == "Stopping…") { busy.value = false; status.value = ""; items.update { l -> l.map { if (it is ChatItem.Assistant && it.streaming) it.copy(streaming = false) else if (it is ChatItem.Tool && !it.done) it.copy(done = true) else it } } }
+        }
+        return ok
+    }
 
     fun answer(ask: ServerAsk, result: JsonObject) {
+        val idStr = (ask.id as? JsonPrimitive)?.content.orEmpty()
+        if (idStr.startsWith("resume-approval:")) {
+            asks.update { l -> l.filterNot { it.id == ask.id } }
+            scope.launch { runCatching { rpc("approval.respond", buildJsonObject {
+                put("session_id", runtimeSid); put("choice", result.s("choice").ifBlank { "deny" })
+                idStr.removePrefix("resume-approval:").takeIf { it.isNotBlank() }?.let { put("request_id", it) }
+            }) } }
+            return
+        }
         val frame = buildJsonObject { put("jsonrpc", "2.0"); put("id", ask.id); put("result", result) }
         ws?.send(frame.toString())
         asks.update { l -> l.filterNot { it.id == ask.id } }

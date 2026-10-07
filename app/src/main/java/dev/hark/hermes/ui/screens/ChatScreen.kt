@@ -6,6 +6,8 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -36,6 +38,7 @@ import dev.hark.hermes.data.*
 import dev.hark.hermes.ui.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import kotlinx.serialization.json.JsonObject
 
 object ChatNav { val pendingResume = MutableStateFlow<Pair<String, String?>?>(null) }
@@ -59,25 +62,69 @@ fun ChatScreen(nav: NavHostController) {
     var input by remember { mutableStateOf("") }
     var showHistory by remember { mutableStateOf(false) }
     var showModels by remember { mutableStateOf(false) }
+    val reasoningLvl by g.reasoning.collectAsStateWithLifecycle()
+    val reconn by g.reconnecting.collectAsStateWithLifecycle()
+    val fastOn by g.fast.collectAsStateWithLifecycle()
+    LaunchedEffect(conn, model) { if (conn == Conn.Ready) g.loadRunSettings() }
     var editing by remember { mutableStateOf<ChatItem.User?>(null) }
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
-    var showSubs by remember { mutableStateOf(false) }
+    val showSubs by SubagentSheetState.open.collectAsStateWithLifecycle()
     var askBtw by remember { mutableStateOf(false) }
     val yolo by g.yolo.collectAsStateWithLifecycle()
     val attachments by g.attachments.collectAsStateWithLifecycle()
     var uploading by remember { mutableStateOf(0) }
     var hints by remember { mutableStateOf<List<SlashHint>>(emptyList()) }
     var replaceFrom by remember { mutableStateOf(0) }
+    var atMode by remember { mutableStateOf(false) }
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    val picker = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.GetMultipleContents()) { uris ->
+    fun ingest(uris: List<android.net.Uri>) {
         uris.forEach { uri ->
             uploading++
             scope.launch {
                 try {
-                    val (bytes, name, mime) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { readUri(ctx, uri) }
-                    if (bytes.size > 25 * 1024 * 1024) toast("$name is over 25 MB") else g.attach(bytes, name, mime)
+                    val (bytes, name, mime) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        val raw = readUri(ctx, uri)
+                        if (raw.third.startsWith("image/")) prepareImage(ctx, uri, raw.first, raw.second, raw.third) else raw
+                    }
+                    if (bytes.size > 25 * 1024 * 1024) toast("$name is over 25 MB")
+                    else g.attach(bytes, name, mime, if (mime.startsWith("image/")) uri.toString() else "")
                 } catch (e: Exception) { toast(errText(e)) } finally { uploading-- }
+            }
+        }
+    }
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.GetMultipleContents()) { ingest(it) }
+    val photoPicker = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia(10)) { ingest(it) }
+    var cameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    val camera = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.TakePicture()) { ok ->
+        cameraUri?.let { if (ok) ingest(listOf(it)) }
+    }
+    fun openCamera() {
+        val dir = java.io.File(ctx.cacheDir, "camera").apply { mkdirs() }
+        val f = java.io.File(dir, "photo_${System.currentTimeMillis()}.jpg")
+        val uri = androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+        cameraUri = uri
+        try { camera.launch(uri) } catch (e: Exception) { scope.toast("No camera app found") }
+    }
+    var showAttach by remember { mutableStateOf(false) }
+    var mediaVersion by remember { mutableIntStateOf(0) }
+    val mediaPerm = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { mediaVersion++ }
+    fun pasteClipboard() {
+        val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+        val clipData = cm?.primaryClip ?: return scope.toast("Clipboard is empty").let { }
+        val itemC = clipData.getItemAt(0)
+        val uri = itemC.uri
+        val mime = clipData.description.takeIf { it.mimeTypeCount > 0 }?.getMimeType(0).orEmpty()
+        when {
+            uri != null && (mime.startsWith("image/") || ctx.contentResolver.getType(uri)?.startsWith("image/") == true) -> ingest(listOf(uri))
+            uri != null && mime != "text/plain" -> ingest(listOf(uri))
+            else -> {
+                val t = itemC.coerceToText(ctx)?.toString().orEmpty()
+                if (t.isBlank()) scope.toast("Nothing to paste")
+                else if (t.length > 4000) {   // long pastes travel as a file, like ChatGPT
+                    uploading++
+                    scope.launch { try { g.attach(t.toByteArray(), "pasted.txt", "text/plain") } catch (e: Exception) { toast(errText(e)) } finally { uploading-- } }
+                } else input = if (input.isBlank()) t else input.trimEnd() + "\n" + t
             }
         }
     }
@@ -105,11 +152,40 @@ fun ChatScreen(nav: NavHostController) {
         }
     }
     // slash suggestions follow the typed command token
-    LaunchedEffect(input) {
-        val token = input.substringAfterLast(' ')
-        if (!input.startsWith("/") || (input.contains(' ') && !token.startsWith("/") && input.count { it == ' ' } > 1)) { hints = emptyList(); return@LaunchedEffect }
-        kotlinx.coroutines.delay(120)
-        runCatching { g.completeSlash(input) }.onSuccess { (h, from) -> hints = h.take(8); replaceFrom = from }.onFailure { hints = emptyList() }
+    val catalog by g.catalog.collectAsStateWithLifecycle()
+    LaunchedEffect(input, catalog) {
+        // @ tags a file or folder on Hermes' machine (complete.path, same as desktop and the TUI)
+        val tokStart = input.lastIndexOfAny(charArrayOf(' ', '\n')) + 1
+        val tok = input.substring(tokStart)
+        if (tok.startsWith("@")) {
+            kotlinx.coroutines.delay(90)
+            runCatching { g.completePath(tok) }.onSuccess { hints = it.take(40); replaceFrom = tokStart; atMode = true }.onFailure { hints = emptyList() }
+            return@LaunchedEffect
+        }
+        atMode = false
+        if (!input.startsWith("/")) { hints = emptyList(); return@LaunchedEffect }
+        if (!input.contains(' ')) {
+            // instant, on-device filtering of every command and skill
+            if (catalog.isEmpty()) runCatching { g.loadCatalog() }
+            val q = input.drop(1).lowercase()
+            hints = if (q.isEmpty()) catalog.sortedWith(compareBy<SlashHint> { it.skill }.thenByDescending { it.usage }.thenBy { it.text })
+            else catalog.mapNotNull { h ->
+                val n = h.text.drop(1).lowercase()
+                val rank = when {
+                    n.startsWith(q) -> 0
+                    n.split('-', '_', ':').any { it.startsWith(q) } -> 1
+                    n.contains(q) -> 2
+                    q.length >= 3 && h.meta.lowercase().contains(q) -> 3
+                    else -> return@mapNotNull null
+                }
+                rank to h
+            }.sortedWith(compareBy<Pair<Int, SlashHint>> { it.first }.thenByDescending { it.second.usage }.thenBy { it.second.text.length }).map { it.second }
+            replaceFrom = 0
+            return@LaunchedEffect
+        }
+        // arguments: ask the server, it knows each command's options
+        kotlinx.coroutines.delay(80)
+        runCatching { g.completeSlash(input) }.onSuccess { (h, from) -> hints = h.take(30); replaceFrom = from }.onFailure { hints = emptyList() }
     }
     val listState = rememberLazyListState()
 
@@ -123,7 +199,28 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
     }
-    LaunchedEffect(items.size, items.lastOrNull()) { if (items.isNotEmpty()) listState.animateScrollToItem(items.size) }
+    val rows = remember(items, busy) { foldTurns(items, busy) }
+    // follow the stream only while the reader is at the bottom; a drag up pins the view where they are
+    var stick by remember { mutableStateOf(true) }
+    val dragged by listState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(dragged) { if (dragged) stick = false }
+    LaunchedEffect(Unit) {
+        snapshotFlow { listState.canScrollForward }.collect { more -> if (!more && !listState.isScrollInProgress) stick = true }
+    }
+    LaunchedEffect(Unit) { snapshotFlow { listState.isScrollInProgress }.collect { moving -> if (!moving && !listState.canScrollForward) stick = true } }
+    val userCount = items.count { it is ChatItem.User }
+    LaunchedEffect(userCount) { stick = true }
+    LaunchedEffect(rows.size, items.lastOrNull(), busy, stick) {
+        if (stick && rows.isNotEmpty() && !dragged) { val n = listState.layoutInfo.totalItemsCount; if (n > 0) listState.scrollToItem(n - 1) }
+    }
+    // ask once for notification permission so live progress and "reply ready" can show
+    val notifPerm = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(busy) {
+        if (busy && android.os.Build.VERSION.SDK_INT >= 33 && !app.store.askedNotif &&
+            androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            app.store.askedNotif = true; notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val topInset = LocalTopInset.current
     Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
@@ -138,7 +235,7 @@ fun ChatScreen(nav: NavHostController) {
                     Row(Modifier.weight(1f, fill = false).clip(RoundedCornerShape(8.dp)).clickable(enabled = conn == Conn.Ready) { showModels = true }.padding(vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            when (conn) { Conn.Ready -> model.ifBlank { "Pick a model" }; Conn.Connecting -> "Connecting…"; Conn.Failed -> connErr ?: "Disconnected"; else -> "Offline" },
+                            when (conn) { Conn.Ready -> model.ifBlank { "Pick a model" } + thinkLabel(reasoningLvl) + (if (fastOn) " · fast" else ""); Conn.Connecting -> if (reconn) "Reconnecting…" else "Connecting…"; Conn.Failed -> connErr ?: "Disconnected"; else -> "Offline" },
                             style = MaterialTheme.typography.bodySmall, color = p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         )
                         if (conn == Conn.Ready) Icon(Icons.Outlined.ExpandMore, "Change model", tint = p.faint, modifier = Modifier.size(16.dp))
@@ -163,15 +260,8 @@ fun ChatScreen(nav: NavHostController) {
                     fun go(f: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) { menu = false; scope.launch { try { f() } catch (e: Exception) { toast(errText(e)) } } }
                     DropdownMenuItem({ Text("Rename chat") }, { menu = false; renaming = true }, leadingIcon = { Icon(Icons.Outlined.Edit, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Side question (btw)") }, { menu = false; askBtw = true }, leadingIcon = { Icon(Icons.Outlined.QuestionAnswer, null) }, enabled = ready)
-                    DropdownMenuItem({ Text("Subagents") }, { menu = false; showSubs = true }, leadingIcon = { Icon(Icons.Outlined.AccountTree, null) }, enabled = ready)
+                    DropdownMenuItem({ Text("Subagents") }, { menu = false; SubagentSheetState.open.value = true }, leadingIcon = { Icon(Icons.Outlined.AccountTree, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Compress context") }, { go { toast(g.compress()) } }, leadingIcon = { Icon(Icons.Outlined.Compress, null) }, enabled = ready && !busy)
-                    DropdownMenuItem({ Text("Undo last turn") }, { go { g.runSlash("/undo")?.let { input = it } } }, leadingIcon = { Icon(Icons.AutoMirrored.Outlined.Undo, null) }, enabled = ready && !busy)
-                    DropdownMenuItem({ Text("Branch this chat") }, { go { g.runSlash("/branch")?.let { input = it } } }, leadingIcon = { Icon(Icons.Outlined.CallSplit, null) }, enabled = ready && !busy)
-                    HorizontalDivider(color = p.line)
-                    DropdownMenuItem({ Text("Fast mode") }, { go { g.setSessionFlag("fast", "toggle"); toast("Fast mode toggled") } }, leadingIcon = { Icon(Icons.Outlined.Speed, null) }, enabled = ready)
-                    listOf("low", "medium", "high").forEach { lvl ->
-                        DropdownMenuItem({ Text("Reasoning: $lvl") }, { go { g.setSessionFlag("reasoning", lvl); toast("Reasoning set to $lvl") } }, leadingIcon = { Icon(Icons.Outlined.Psychology, null) }, enabled = ready)
-                    }
                 }
             }
             Box(Modifier.size(40.dp).press { scope.launch { try { g.newChat() } catch (e: Exception) { toast(errText(e)) } } }.glass(CircleShape, p.accentSoft),
@@ -190,32 +280,50 @@ fun ChatScreen(nav: NavHostController) {
         Box(Modifier.weight(1f)) {
             if (items.isEmpty() && !loadingSession) EmptyChat { input = it }
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                val lastA = items.indexOfLast { it is ChatItem.Assistant }
-                val lastU = items.indexOfLast { it is ChatItem.User }
-                itemsIndexed(items, key = { _, it -> it.key }) { i, it ->
-                    ChatRow(it, canRegen = i == lastA && i > lastU && !busy,
-                        onEdit = { u -> editing = u },
-                        onRegen = { scope.launch { g.regenerate() } })
+                val lastA = rows.indexOfLast { it is Seg.Item && it.item is ChatItem.Assistant }
+                val lastU = rows.indexOfLast { it is Seg.Item && it.item is ChatItem.User }
+                itemsIndexed(rows, key = { _, it -> it.key }) { i, r ->
+                    when (r) {
+                        is Seg.Work -> WorkBlock(r, status)
+                        is Seg.Item -> ChatRow(r.item, stats = r.stats, canRegen = i == lastA && i > lastU && !busy,
+                            onEdit = { u -> editing = u },
+                            onRegen = { scope.launch { g.regenerate() } })
+                    }
                 }
-                if (busy) item("__typing") { Typing(status) }
+                if (busy && rows.lastOrNull().let { it !is Seg.Work && !(it is Seg.Item && it.item is ChatItem.Assistant && (it.item as ChatItem.Assistant).streaming) }) item("__typing") { Typing(status) }
                 item("__end") { Spacer(Modifier.height(4.dp)) }
             }
             if (loadingSession) LoadingCard()
+            androidx.compose.animation.AnimatedVisibility(!stick && listState.canScrollForward, Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp),
+                enter = fadeIn() + scaleIn(initialScale = 0.7f), exit = fadeOut() + scaleOut(targetScale = 0.7f)) {
+                Box(Modifier.size(40.dp).clip(CircleShape).glass(CircleShape).clickable {
+                    stick = true; scope.launch { val n = listState.layoutInfo.totalItemsCount; if (n > 0) listState.animateScrollToItem(n - 1) }
+                }, contentAlignment = Alignment.Center) {
+                    Icon(Icons.Outlined.KeyboardArrowDown, "Jump to latest", tint = p.ink, modifier = Modifier.size(22.dp))
+                }
+            }
         }
 
         asks.firstOrNull()?.let { AskCard(it) }
 
         // slash command suggestions
         AnimatedVisibility(hints.isNotEmpty(), enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-            Column(Modifier.padding(horizontal = 14.dp).fillMaxWidth().heightIn(max = 280.dp)
+            Column(Modifier.padding(horizontal = 14.dp).fillMaxWidth().heightIn(max = 320.dp)
                 .glass(RoundedCornerShape(20.dp), if (p.dark) p.sheet.copy(alpha = 0.97f) else androidx.compose.ui.graphics.Color.White)
                 .verticalScroll(rememberScrollState()).padding(vertical = 6.dp)) {
-                hints.forEach { h ->
+                hints.take(80).forEach { h ->
                     Row(Modifier.fillMaxWidth().clickable {
-                        input = input.take(replaceFrom.coerceIn(0, input.length)) + h.text.let { if (replaceFrom > 0 && it.startsWith("/") && input.getOrNull(replaceFrom - 1) == '/') it.drop(1) else it } + " "
+                        if (atMode) {
+                            // folders keep the picker open so you can drill in; files finish the tag
+                            val dir = h.text.endsWith("/") || h.text.endsWith(":")   // @folder/ drills in, @file: and @url: wait for the rest
+                            input = input.take(replaceFrom.coerceIn(0, input.length)) + h.text + if (dir) "" else " "
+                            if (!dir) hints = emptyList()
+                            return@clickable
+                        }
+                        input = if (replaceFrom == 0 && !input.contains(' ')) h.text + " " else input.take(replaceFrom.coerceIn(0, input.length)) + h.text.let { if (replaceFrom > 0 && it.startsWith("/") && input.getOrNull(replaceFrom - 1) == '/') it.drop(1) else it } + " "
                         hints = emptyList()
                     }.padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(if (h.skill) Icons.Outlined.AutoAwesome else Icons.Outlined.Terminal, null, tint = p.accent, modifier = Modifier.size(16.dp))
+                        Icon(when { atMode && h.text.endsWith("/") -> Icons.Outlined.Folder; atMode && h.meta == "profile" -> Icons.Outlined.Person; atMode -> Icons.Outlined.Description; h.skill -> Icons.Outlined.AutoAwesome; else -> Icons.Outlined.Terminal }, null, tint = p.accent, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(10.dp))
                         Text(h.display, color = p.ink, fontFamily = Mono, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
                         if (h.meta.isNotBlank()) {
@@ -228,10 +336,44 @@ fun ChatScreen(nav: NavHostController) {
         }
 
         // staged attachments
+        // queued follow-ups, and steer/queue choices while a turn runs
+        val queued by g.queued.collectAsStateWithLifecycle()
+        if (queued.isNotEmpty()) Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp).fillMaxWidth()) {
+            queued.forEachIndexed { qi, q ->
+                Row(Modifier.padding(vertical = 2.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.accentSoft.copy(alpha = 0.5f)).padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Schedule, null, tint = p.accent, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(8.dp))
+                    Text(q, color = p.ink, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    TextButton({ scope.launch { try { g.sendQueuedNow(qi) } catch (e: Exception) { toast(errText(e)) } } }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(if (busy) "Steer" else "Send", color = p.accent, style = MaterialTheme.typography.labelMedium) }
+                    IconButton({ g.unqueue(qi) }, Modifier.size(32.dp)) { Icon(Icons.Outlined.Close, "Remove", tint = p.faint, modifier = Modifier.size(16.dp)) }
+                }
+            }
+        }
+        AnimatedVisibility(busy && input.isNotBlank() && !input.startsWith("/"), enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+            Row(Modifier.padding(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.clip(RoundedCornerShape(50)).background(p.accent).clickable {
+                    val t = input.trim(); input = ""
+                    scope.launch { try { g.steer(t) } catch (e: Exception) { g.enqueue(t); toast("Couldn't steer, so it's queued for after this turn") } }
+                }.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.AutoMirrored.Outlined.Send, null, tint = p.accentInk, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(6.dp))
+                    Text("Steer now", color = p.accentInk, style = MaterialTheme.typography.labelLarge)
+                }
+                Row(Modifier.clip(RoundedCornerShape(50)).background(p.accentSoft).clickable { g.enqueue(input.trim()); input = "" }
+                    .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Schedule, null, tint = p.ink, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(6.dp))
+                    Text("Queue for after", color = p.ink, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
         if (attachments.isNotEmpty() || uploading > 0) {
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 14.dp, end = 14.dp, top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 attachments.forEach { a ->
-                    Row(Modifier.clip(RoundedCornerShape(14.dp)).background(p.accentSoft).padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (a.kind == "image" && a.thumb.isNotBlank()) Box(Modifier.size(64.dp)) {
+                        UriThumb(android.net.Uri.parse(a.thumb), 64.dp, Modifier.clip(RoundedCornerShape(14.dp)))
+                        Box(Modifier.align(Alignment.TopEnd).padding(3.dp).size(22.dp).clip(CircleShape).background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.55f))
+                            .clickable { scope.launch { g.detach(a) } }, contentAlignment = Alignment.Center) {
+                            Icon(Icons.Outlined.Close, "Remove", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(13.dp))
+                        }
+                    } else Row(Modifier.clip(RoundedCornerShape(14.dp)).background(p.accentSoft).padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(when (a.kind) { "image" -> Icons.Outlined.Image; "pdf" -> Icons.Outlined.PictureAsPdf; else -> Icons.Outlined.Description }, null, tint = p.ink, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(a.name + if (a.pages > 0) " · ${a.pages}p" else "", color = p.ink, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 160.dp))
@@ -255,8 +397,9 @@ fun ChatScreen(nav: NavHostController) {
                 .padding(start = 6.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            Box(Modifier.size(48.dp).clip(CircleShape).clickable { picker.launch("*/*") }, contentAlignment = Alignment.Center) {
-                Icon(Icons.Outlined.AttachFile, "Attach", tint = p.muted, modifier = Modifier.size(22.dp))
+            Box(Modifier.size(48.dp).clip(CircleShape).clickable { showAttach = true }, contentAlignment = Alignment.Center) {
+                val turn by animateFloatAsState(if (showAttach) 45f else 0f, label = "plus")
+                Icon(Icons.Outlined.Add, "Attach", tint = p.muted, modifier = Modifier.size(26.dp).graphicsLayer { rotationZ = turn })
             }
             Box(Modifier.weight(1f).heightIn(min = 48.dp).padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
                 if (input.isEmpty()) Text("Message or /command", color = p.faint, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp))
@@ -275,13 +418,15 @@ fun ChatScreen(nav: NavHostController) {
             val btn by animateColorAsState(p.accent, label = "send")
             Box(
                 Modifier.size(48.dp).press {
-                        if (busy && !canSend) scope.launch { g.interrupt() }
+                        if (busy && !canSend) scope.launch { if (!g.interrupt()) toast("Couldn't reach Hermes to stop. Retrying…").also { g.interrupt() } }
                         else if (!canSend) withMic { if (dict.listening) dict.cancel(); voiceMode = true }
                         else {
                             val t = input.trim(); input = ""; hints = emptyList()
                             scope.launch {
                                 if (t.startsWith("/") && attachments.isEmpty()) {
                                     try { g.runSlash(t)?.let { input = it } } catch (e: Exception) { toast(errText(e)) }
+                                } else if (busy && attachments.isEmpty()) {
+                                    try { g.steer(t) } catch (e: Exception) { g.enqueue(t); toast("Couldn't steer, so it's queued for after this turn") }
                                 } else g.send(t)
                             }
                         }
@@ -297,6 +442,20 @@ fun ChatScreen(nav: NavHostController) {
     }
 
     if (voiceMode) VoiceMode { voiceMode = false }
+    if (showAttach) AttachSheet(
+        draft = input, onDismiss = { showAttach = false },
+        onCamera = { showAttach = false; openCamera() },
+        onPhotos = { photoPicker.launch(androidx.activity.result.PickVisualMediaRequest(androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+        onFiles = { picker.launch("*/*") },
+        onPaste = { pasteClipboard() },
+        onRecent = { ingest(it) },
+        onAskMedia = {
+            val perms = if (android.os.Build.VERSION.SDK_INT >= 34) arrayOf(mediaPermission(), android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) else arrayOf(mediaPermission())
+            mediaPerm.launch(perms)
+        },
+        onInsert = { t -> input = if (input.isBlank()) t else input.trimEnd() + " " + t },
+        mediaVersion = mediaVersion,
+    )
     editing?.let { u ->
         TextPrompt("Edit message", u.raw, "Send", note = "Everything after this message is replaced.", onDismiss = { editing = null }) { t ->
             editing = null; scope.launch { g.edit(u, t) }
@@ -308,7 +467,7 @@ fun ChatScreen(nav: NavHostController) {
     if (askBtw) TextPrompt("Side question", "", "Ask", note = "Answered from this chat's context without adding to it.", onDismiss = { askBtw = false }) { t ->
         askBtw = false; scope.launch { try { g.btw(t) } catch (e: Exception) { toast(errText(e)) } }
     }
-    if (showSubs) SubagentSheet { showSubs = false }
+    if (showSubs) SubagentSheet { SubagentSheetState.open.value = false }
     if (showModels) ModelSheet { showModels = false }
 
     if (showHistory) {
@@ -353,15 +512,16 @@ private fun EmptyChat(pick: (String) -> Unit) {
 }
 
 @Composable
-private fun ChatRow(item: ChatItem, canRegen: Boolean = false, onEdit: (ChatItem.User) -> Unit = {}, onRegen: () -> Unit = {}) {
+private fun ChatRow(item: ChatItem, canRegen: Boolean = false, stats: TurnStats? = null, onEdit: (ChatItem.User) -> Unit = {}, onRegen: () -> Unit = {}) {
     val p = LocalPalette.current
     val clip = LocalClipboardManager.current
     when (item) {
         is ChatItem.User -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             var open by remember { mutableStateOf(false) }
             val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
-            Box(Modifier.padding(start = 48.dp)) {
-                Text(item.text, color = p.userInk, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 25.sp),
+            Column(Modifier.padding(start = 48.dp), horizontalAlignment = Alignment.End) {
+                SentAttachments(item.files)
+                if (item.text.isNotBlank()) Text(item.text, color = p.userInk, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 25.sp),
                     modifier = Modifier.entrance().clip(RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp))
                         .combinedClickable(onClick = {}, onLongClick = { haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress); open = true })
                         .glass(RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp), p.userBubble).padding(horizontal = 20.dp, vertical = 15.dp))
@@ -369,6 +529,7 @@ private fun ChatRow(item: ChatItem, canRegen: Boolean = false, onEdit: (ChatItem
                     if (item.ordinal >= 0) DropdownMenuItem({ Text("Edit") }, { open = false; onEdit(item) }, leadingIcon = { Icon(Icons.Outlined.Edit, null) })
                     DropdownMenuItem({ Text("Copy") }, { open = false; clip.setText(AnnotatedString(item.raw)) }, leadingIcon = { Icon(Icons.Outlined.ContentCopy, null) })
                 }
+                AgentReactions(item.reactions)
             }
         }
         is ChatItem.Assistant -> Column(Modifier.padding(end = 36.dp).entrance().animateContentSize(spring(dampingRatio = 0.9f, stiffness = Spring.StiffnessMedium))
@@ -385,14 +546,21 @@ private fun ChatRow(item: ChatItem, canRegen: Boolean = false, onEdit: (ChatItem
                 }
             }
             if (item.text.isNotBlank()) {
-                SelectionContainer { Markdown(item.text) }
+                val shown = rememberSmoothText(item.key, item.text, item.streaming)
+                SelectionContainer { Markdown(shown) }
+                if (!item.streaming) {
+                    val inlineSrc = remember(item.text) { Regex("(?m)^\\s*(?:MEDIA:|!\\[[^\\]]*\\]\\()\\s*([^)\\s]+)").findAll(item.text).map { it.groupValues[1] }.toSet() }
+                    val paths = remember(item.text) { findPaths(item.text).filterNot { it in inlineSrc } }
+                    FileChips(paths)
+                }
                 if (!item.streaming) Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    ReactionControl(item.key, item.reactions)
                     Icon(Icons.Outlined.ContentCopy, "Copy", tint = p.faint, modifier = Modifier.size(28.dp).clip(CircleShape).clickable { clip.setText(AnnotatedString(item.text)) }.padding(6.dp))
                     if (canRegen) Icon(Icons.Outlined.Refresh, "Regenerate", tint = p.faint, modifier = Modifier.size(28.dp).clip(CircleShape).clickable { onRegen() }.padding(6.dp))
                 }
             }
             val nerd by app.store.nerd.collectAsStateWithLifecycle()
-            if (nerd && item.firstMs > 0) NerdStats(item)
+            (stats ?: TurnStats.of(listOf(item)))?.let { if (nerd) NerdStats(it) }
         }
         is ChatItem.Tool -> {
             var open by remember { mutableStateOf(false) }
@@ -507,14 +675,14 @@ private fun AskCard(ask: ServerAsk) {
 
 /** Optional "stats for nerds" strip under a reply: speed, latency, size, time. */
 @Composable
-private fun NerdStats(a: ChatItem.Assistant) {
+private fun NerdStats(a: TurnStats) {
     val p = LocalPalette.current
     // tick while streaming so the live rate keeps moving between deltas
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    if (a.streaming) LaunchedEffect(a.key) { while (true) { kotlinx.coroutines.delay(250); now = System.currentTimeMillis() } }
+    if (a.live) LaunchedEffect(a.segs.first().key) { while (true) { kotlinx.coroutines.delay(250); now = System.currentTimeMillis() } }
     val tps = a.tps(now)
-    val ttft = if (a.startMs > 0) (a.firstMs - a.startMs) / 1000.0 else 0.0
-    val total = ((if (a.endMs > 0) a.endMs else now) - (if (a.startMs > 0) a.startMs else a.firstMs)) / 1000.0
+    val ttft = a.ttft()
+    val total = a.total(now)
     val tok = (if (a.exact) "" else "~") + humanTokens(a.tokens)
     val speedColor by animateColorAsState(when { tps >= 60 -> p.good; tps >= 20 -> p.accent; tps > 0 -> p.warn; else -> p.faint }, label = "tps")
     Row(
@@ -556,8 +724,10 @@ private fun ModelSheet(onClose: () -> Unit) {
     var switching by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { try { data = g.modelOptions() } catch (e: Exception) { err = errText(e) } }
     ModalBottomSheet(onClose, containerColor = p.sheet) {
-        Text("Model for this chat", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
-        Text("Only this conversation changes. Your default stays the same.", style = MaterialTheme.typography.bodySmall, color = p.muted, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        Text("This chat", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
+        Text("Changes here apply to this conversation only.", style = MaterialTheme.typography.bodySmall, color = p.muted, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        RunSettings()
+        Text("Model", color = p.faint, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(start = 22.dp, top = 10.dp))
         OutlinedTextField(query, { query = it }, placeholder = { Text("Search models") }, singleLine = true, shape = RoundedCornerShape(16.dp),
             leadingIcon = { Icon(Icons.Outlined.Search, null) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
         val rows = data?.a("providers")?.objs().orEmpty().mapNotNull { row ->
@@ -668,5 +838,221 @@ private fun SubagentSheet(onClose: () -> Unit) {
             }
         }
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+
+private val THINK_LEVELS = listOf("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+private val THINK_NAMES = mapOf("none" to "Off", "minimal" to "Minimal", "low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "Extra high", "max" to "Max", "ultra" to "Ultra")
+private val THINK_HINTS = mapOf("none" to "Answers straight away", "minimal" to "A quick glance first", "low" to "Light thinking, fast replies",
+    "medium" to "Balanced for most tasks", "high" to "Works through harder problems", "xhigh" to "Deep reasoning, slower",
+    "max" to "As much as the model allows", "ultra" to "Everything it has. Slowest and priciest")
+
+internal fun thinkLabel(v: String) = if (v.isBlank() || v == "medium") "" else " · " + (THINK_NAMES[v] ?: v).lowercase()
+
+/** One stepped slider for every thinking level, plus a fast-mode switch. */
+@Composable
+private fun RunSettings() {
+    val p = LocalPalette.current
+    val g = app.gateway
+    val scope = rememberCoroutineScope()
+    val cur by g.reasoning.collectAsStateWithLifecycle()
+    val fast by g.fast.collectAsStateWithLifecycle()
+    val curIdx = THINK_LEVELS.indexOf(cur).takeIf { it >= 0 } ?: 3
+    var pos by remember(curIdx) { mutableFloatStateOf(curIdx.toFloat()) }
+    val idx = pos.roundToInt().coerceIn(0, THINK_LEVELS.lastIndex)
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    LaunchedEffect(idx) { if (idx != curIdx) haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove) }
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(p.accentSoft.copy(alpha = 0.45f)).padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Psychology, null, tint = p.accent, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp))
+            Text("Thinking", color = p.ink, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            AnimatedContent(THINK_NAMES[THINK_LEVELS[idx]] ?: "", transitionSpec = { fadeIn(tween(140)) togetherWith fadeOut(tween(100)) }, label = "lvl") {
+                Text(it, color = p.accent, style = MaterialTheme.typography.titleSmall)
+            }
+        }
+        Slider(pos, { pos = it }, valueRange = 0f..THINK_LEVELS.lastIndex.toFloat(), steps = THINK_LEVELS.size - 2,
+            onValueChangeFinished = {
+                val v = THINK_LEVELS[pos.roundToInt().coerceIn(0, THINK_LEVELS.lastIndex)]
+                scope.launch { try { g.setSessionFlag("reasoning", v) } catch (e: Exception) { pos = curIdx.toFloat(); toast(errText(e)) } }
+            },
+            colors = SliderDefaults.colors(thumbColor = p.accent, activeTrackColor = p.accent, inactiveTrackColor = p.line, activeTickColor = p.accentInk.copy(alpha = 0.5f), inactiveTickColor = p.faint.copy(alpha = 0.4f)))
+        Text(THINK_HINTS[THINK_LEVELS[idx]] ?: "", color = p.muted, style = MaterialTheme.typography.bodySmall)
+        Text("Not every model supports every level; Hermes uses the nearest one it can.", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 2.dp))
+        HorizontalDivider(color = p.line, modifier = Modifier.padding(vertical = 12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Speed, null, tint = p.accent, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Fast mode", color = p.ink, style = MaterialTheme.typography.titleSmall)
+                Text("Priority processing where the provider offers it", color = p.muted, style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(fast, { on -> scope.launch { try { g.setSessionFlag("fast", if (on) "fast" else "normal") } catch (e: Exception) { toast(errText(e)) } } })
+        }
+    }
+}
+
+
+/** A whole turn's reasoning and tool calls, folded to one line. Tap to see the steps. */
+@Composable
+private fun WorkBlock(w: Seg.Work, status: String) {
+    val p = LocalPalette.current
+    var open by rememberSaveable(w.key) { mutableStateOf(false) }
+    val items by app.gateway.items.collectAsStateWithLifecycle()
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    if (w.live) LaunchedEffect(w.key) { while (true) { now = System.currentTimeMillis(); kotlinx.coroutines.delay(1000) } }
+    val start = w.startMs
+    val title = when {
+        w.live -> liveActivity(items, status)
+        start > 0 && w.endMs > start -> "Worked for ${fmtDur(w.endMs - start)}"
+        w.toolCount > 0 -> "Worked through ${w.toolCount} step${if (w.toolCount == 1) "" else "s"}"
+        else -> "Thought it through"
+    }
+    Column(Modifier.fillMaxWidth().entrance().animateContentSize(spring(dampingRatio = 0.9f, stiffness = Spring.StiffnessMediumLow))) {
+        Row(Modifier.clip(RoundedCornerShape(14.dp)).clickable { open = !open }.padding(vertical = 6.dp, horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (w.live) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = p.accent)
+            else Icon(Icons.Outlined.AutoAwesome, null, tint = p.faint, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.width(8.dp))
+            AnimatedContent(title, transitionSpec = { fadeIn(tween(180)) togetherWith fadeOut(tween(120)) }, label = "wt", modifier = Modifier.weight(1f, fill = false)) { t ->
+                Text(t, color = p.muted, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (w.live && start > 0) Text("  " + fmtDur(now - start), color = p.faint, style = MaterialTheme.typography.labelSmall)
+            Icon(if (open) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, if (open) "Hide steps" else "Show steps", tint = p.faint, modifier = Modifier.size(18.dp))
+        }
+        AnimatedVisibility(open) {
+            Column(Modifier.padding(start = 6.dp, top = 2.dp).border(width = 0.dp, color = androidx.compose.ui.graphics.Color.Transparent)) {
+                w.steps.forEach { st -> WorkStep(st) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkStep(st: ChatItem) {
+    val p = LocalPalette.current
+    var open by remember(st.key) { mutableStateOf(false) }
+    Row(Modifier.height(IntrinsicSize.Min)) {
+        Box(Modifier.width(2.dp).fillMaxHeight().background(p.faint.copy(alpha = 0.3f)))
+        Column(Modifier.padding(start = 12.dp, bottom = 6.dp).fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { open = !open }.padding(vertical = 4.dp, horizontal = 4.dp)) {
+            when (st) {
+                is ChatItem.Tool -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (st.done) Icon(Icons.Outlined.Check, null, tint = p.good, modifier = Modifier.size(14.dp))
+                        else CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = p.ink)
+                        Spacer(Modifier.width(8.dp))
+                        Text(friendlyTool(st.name), color = p.ink, style = MaterialTheme.typography.bodySmall)
+                        if (st.preview.isNotBlank()) Text("  " + st.preview.lineSequence().first(), color = p.faint, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        else Spacer(Modifier.weight(1f))
+                        if (st.duration > 0) Text(String.format("%.1fs", st.duration), color = p.faint, style = MaterialTheme.typography.labelSmall)
+                    }
+                    AnimatedVisibility(open) {
+                        Column(Modifier.padding(top = 6.dp)) {
+                            Text(st.name, color = p.faint, fontFamily = Mono, style = MaterialTheme.typography.labelSmall)
+                            if (st.preview.isNotBlank()) CodeBlock(st.preview, 160.dp)
+                            if (st.summary.isNotBlank()) Text(st.summary, color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                        }
+                    }
+                    if (isHelper(st.name)) Row(Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(p.accentSoft)
+                        .clickable { SubagentSheetState.open.value = true }.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.AccountTree, null, tint = p.accent, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(6.dp))
+                        Text(if (st.done) "View helpers" else "Watch helper live", color = p.accent, style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+                is ChatItem.Assistant -> {
+                    if (st.reasoning.isNotBlank()) Row(verticalAlignment = Alignment.Top) {
+                        Icon(Icons.Outlined.Psychology, null, tint = p.faint, modifier = Modifier.size(14.dp).padding(top = 1.dp)); Spacer(Modifier.width(8.dp))
+                        Text(st.reasoning.trim(), color = p.muted, style = MaterialTheme.typography.bodySmall, maxLines = if (open) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (st.text.isNotBlank()) Row(verticalAlignment = Alignment.Top, modifier = Modifier.padding(top = if (st.reasoning.isNotBlank()) 4.dp else 0.dp)) {
+                        Icon(Icons.Outlined.ChatBubbleOutline, null, tint = p.faint, modifier = Modifier.size(14.dp).padding(top = 1.dp)); Spacer(Modifier.width(8.dp))
+                        Text(st.text.trim(), color = p.ink, style = MaterialTheme.typography.bodySmall, maxLines = if (open) Int.MAX_VALUE else 3, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                else -> {}
+            }
+        }
+    }
+}
+
+
+/**
+ * Reveals streamed text at a steady, frame-paced rate instead of in network-sized bursts.
+ * The pace adapts to the backlog, so a fast model never falls far behind and a slow one
+ * still glides; whole words land at once so nothing flickers mid-word.
+ */
+@Composable
+fun rememberSmoothText(key: String, target: String, streaming: Boolean): String {
+    // replies loaded from history (never seen streaming) show at once
+    val animate = remember(key) { streaming }
+    var shown by remember(key) { mutableIntStateOf(if (streaming) 0 else target.length) }
+    val latest by rememberUpdatedState(target)
+    val live by rememberUpdatedState(streaming)
+    if (animate) LaunchedEffect(key) {
+        var pos = shown.toFloat()
+        var last = 0L
+        while (true) {
+            val now = withFrameNanos { it }
+            val dt = if (last == 0L) 0f else ((now - last) / 1e9f).coerceAtMost(0.05f)
+            last = now
+            val t = latest
+            if (pos > t.length) pos = t.length.toFloat()
+            val backlog = t.length - pos
+            if (backlog <= 0f) { shown = t.length; if (!live) break; continue }
+            // aim to clear the backlog in ~0.3s, never slower than a calm reading pace
+            val rate = (backlog / 0.3f).coerceIn(45f, 6000f)
+            pos = (pos + rate * dt).coerceAtMost(t.length.toFloat())
+            var cut = pos.toInt()
+            // snap forward to the end of the current word (bounded look-ahead)
+            if (cut < t.length && !t[cut].isWhitespace()) {
+                val end = (cut until minOf(t.length, cut + 24)).firstOrNull { t[it].isWhitespace() }
+                if (end != null) cut = end
+            }
+            if (cut != shown) shown = cut
+        }
+    }
+    return if (!animate) target else target.take(shown.coerceAtMost(target.length))
+}
+
+
+private fun isHelper(name: String) = name.contains("delegate", true) || name.contains("subagent", true) || name.contains("agent", true)
+
+/** Tapback on a message, saved on your Hermes server: tap to pick, same emoji again takes it back. Agent reactions show beside yours. */
+@Composable
+private fun ReactionControl(key: String, reactions: List<Reaction>) {
+    val p = LocalPalette.current
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val mine = reactions.firstOrNull { it.author == "user" }?.emoji
+    val theirs = reactions.filter { it.author != "user" }
+    var picking by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        theirs.forEach { r -> Text(r.emoji, fontSize = 15.sp, modifier = Modifier.padding(end = 4.dp).clip(RoundedCornerShape(50)).border(1.dp, p.line, RoundedCornerShape(50)).padding(horizontal = 7.dp, vertical = 2.dp)) }
+        Box {
+            AnimatedContent(mine, transitionSpec = { (scaleIn(spring(dampingRatio = 0.45f, stiffness = Spring.StiffnessMedium)) + fadeIn()) togetherWith (scaleOut() + fadeOut()) }, label = "react") { r ->
+                if (r != null) Text(r, fontSize = 16.sp, modifier = Modifier.clip(RoundedCornerShape(50)).background(p.accentSoft).clickable { picking = true }.padding(horizontal = 8.dp, vertical = 3.dp))
+                else Icon(Icons.Outlined.AddReaction, "React", tint = p.faint, modifier = Modifier.size(28.dp).clip(CircleShape).clickable { picking = true }.padding(6.dp))
+            }
+            DropdownMenu(picking, { picking = false }, containerColor = p.sheet, shape = RoundedCornerShape(50)) {
+                Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    QUICK_REACTIONS.forEach { e ->
+                        Text(e, fontSize = 22.sp, modifier = Modifier.clip(CircleShape).background(if (e == mine) p.accentSoft else androidx.compose.ui.graphics.Color.Transparent)
+                            .clickable {
+                                haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress); picking = false
+                                scope.launch { try { app.gateway.react(key, e) } catch (x: Exception) { toast(errText(x)) } }
+                            }.padding(8.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The agent's reaction on one of your messages (react_to_message tool). */
+@Composable
+private fun AgentReactions(reactions: List<Reaction>) {
+    val p = LocalPalette.current
+    val theirs = reactions.filter { it.author != "user" }
+    if (theirs.isEmpty()) return
+    Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        theirs.forEach { r -> Text(r.emoji, fontSize = 15.sp, modifier = Modifier.clip(RoundedCornerShape(50)).background(p.card).border(1.dp, p.line, RoundedCornerShape(50)).padding(horizontal = 7.dp, vertical = 2.dp)) }
     }
 }
