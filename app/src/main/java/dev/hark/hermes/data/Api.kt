@@ -26,6 +26,9 @@ class Api(private val store: Store) {
         .retryOnConnectionFailure(true)
         .build()
 
+    /** For links in replies: no redirects, so a public URL can't bounce the phone onto your LAN. */
+    private val publicHttp: OkHttpClient by lazy { http.newBuilder().followRedirects(false).followSslRedirects(false).build() }
+
     private val JSONT = "application/json".toMediaType()
     private val refreshLock = Mutex()
     private val _expired = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -151,7 +154,7 @@ class Api(private val store: Store) {
                 val cd = r.header("Content-Disposition").orEmpty()
                 val name = Regex("filename\\*=UTF-8''([^;]+)").find(cd)?.groupValues?.get(1)?.let { java.net.URLDecoder.decode(it, "UTF-8") }
                     ?: Regex("filename=\"?([^\";]+)").find(cd)?.groupValues?.get(1) ?: ""
-                return@withContext Triple(r.body!!.bytes(), r.header("Content-Type").orEmpty().substringBefore(';'), name)
+                return@withContext Triple(readCapped(r.body!!, maxBytes, "File is too large to open on the phone"), r.header("Content-Type").orEmpty().substringBefore(';'), name)
             }
         }
         throw AuthExpired()
@@ -159,10 +162,10 @@ class Api(private val store: Store) {
 
     /** Plain GET of a public URL (images Hermes links to). */
     suspend fun fetchUrl(url: String, maxBytes: Long = 15L * 1024 * 1024): ByteArray = withContext(Dispatchers.IO) {
-        http.newCall(Request.Builder().url(url).get().build()).execute().use { r ->
+        publicHttp.newCall(Request.Builder().url(url).get().build()).execute().use { r ->
             if (!r.isSuccessful) throw ApiException(r.code, "Couldn't load image")
             if ((r.body?.contentLength() ?: 0) > maxBytes) throw ApiException(413, "Image too large")
-            r.body!!.bytes()
+            readCapped(r.body!!, maxBytes, "Image too large")
         }
     }
 
@@ -192,3 +195,33 @@ class Api(private val store: Store) {
         } catch (e: Exception) { txt.take(200).ifBlank { null } }
     }
 }
+
+
+/** Reads a body but stops at [max] bytes, whatever Content-Length claimed (chunked replies have none). */
+internal fun readCapped(body: okhttp3.ResponseBody, max: Long, tooBig: String): ByteArray {
+    val out = java.io.ByteArrayOutputStream()
+    val buf = ByteArray(64 * 1024)
+    body.byteStream().use { input ->
+        while (true) {
+            val n = input.read(buf); if (n < 0) break
+            if (out.size() + n > max) throw ApiException(413, tooBig)
+            out.write(buf, 0, n)
+        }
+    }
+    return out.toByteArray()
+}
+
+/** Loopback, LAN, link-local, CGNAT/Tailscale and .local/.ts.net names: places plain http is normal. */
+fun isPrivateHost(host: String): Boolean {
+    val h = host.lowercase().substringBefore(':').trim('[', ']')
+    if (h == "localhost" || h.endsWith(".local") || h.endsWith(".lan") || h.endsWith(".home.arpa") || h.endsWith(".ts.net") || h.endsWith(".internal")) return true
+    val v4 = h.split('.').mapNotNull { it.toIntOrNull() }.takeIf { it.size == 4 && h.count { c -> c == '.' } == 3 }
+    if (v4 != null) {
+        val (a, b) = v4[0] to v4[1]
+        return a == 10 || a == 127 || (a == 172 && b in 16..31) || (a == 192 && b == 168) || (a == 169 && b == 254) || (a == 100 && b in 64..127)
+    }
+    return h == "::1" || h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")
+}
+
+/** http:// to a public address: tokens and chats would cross the internet unencrypted. */
+fun isInsecureUrl(url: String): Boolean = url.startsWith("http://") && !isPrivateHost(url.removePrefix("http://").substringBefore('/'))

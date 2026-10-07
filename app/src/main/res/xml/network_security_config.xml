@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext stays allowed because self-hosted Hermes often runs over plain http on a LAN or a tailnet;
+  the connect screen warns before you use http with a public address. Only system CAs are trusted:
+  a user-installed CA (or a proxy's) can no longer intercept traffic.
+-->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true">
-        <trust-anchors><certificates src="system" /><certificates src="user" /></trust-anchors>
+        <trust-anchors><certificates src="system" /></trust-anchors>
     </base-config>
 </network-security-config>

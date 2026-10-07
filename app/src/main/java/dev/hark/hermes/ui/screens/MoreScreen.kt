@@ -108,6 +108,16 @@ fun SettingsScreen(nav: NavHostController) {
                 }
             }
         }
+        if (app.store.insecure || app.store.servers.value.any { dev.hark.hermes.data.isInsecureUrl(it.auth.baseUrl) }) item {
+            HCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.LockOpen, null, tint = p.bad); Spacer(Modifier.width(10.dp))
+                    Text(if (app.store.insecure) "This phone couldn't open encrypted storage, so your sign-in is kept in plain app storage. Signing out and back in, or clearing the app's storage, usually fixes it."
+                        else "A saved server uses plain http over the internet. Switch it to https, or a LAN or Tailscale address.",
+                        color = p.ink, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
         item { SectionLabel("Servers") }
         item { ServersCard() }
         item { SectionLabel("Theme") }

@@ -20,9 +20,9 @@ fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
     val out = mutableListOf<Seg>()
     var i = 0
     while (i < items.size) {
-        if (items[i] is ChatItem.User) { out += Seg.Item(items[i]); i++; continue }
+        if (items[i].startsTurn()) { out += Seg.Item(items[i]); i++; continue }
         var j = i
-        while (j < items.size && items[j] !is ChatItem.User) j++
+        while (j < items.size && !items[j].startsTurn()) j++
         val turn = items.subList(i, j)
         val isLast = j == items.size
         val live = isLast && busy

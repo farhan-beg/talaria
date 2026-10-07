@@ -42,7 +42,8 @@ sealed interface ChatItem {
         }
     }
     data class Tool(override val key: String, val name: String, val preview: String, val done: Boolean, val summary: String = "", val duration: Double = 0.0, val startMs: Long = 0, val endMs: Long = 0) : ChatItem
-    data class Notice(override val key: String, val text: String, val error: Boolean = false) : ChatItem
+    /** `boundary`: Hermes started this turn itself (a background agent or process reported back), not you. */
+    data class Notice(override val key: String, val text: String, val error: Boolean = false, val boundary: Boolean = false) : ChatItem
     /** Output of a slash command, shown as a terminal-style card. */
     data class Output(override val key: String, val command: String, val text: String) : ChatItem
 }
@@ -57,6 +58,51 @@ data class ServerAsk(val id: JsonElement, val method: String, val params: JsonOb
 enum class Conn { Idle, Connecting, Ready, Failed }
 
 /** JSON-RPC client for the dashboard's /api/ws gateway — the same transport Hermes Desktop uses for native chat. */
+/** Where a turn begins: your message, or a turn Hermes started on its own. */
+fun ChatItem.startsTurn() = this is ChatItem.User || (this is ChatItem.Notice && boundary)
+
+/** Backend-authored rows Hermes stores as "user" turns but nobody typed (desktop renders these as system rows). */
+private val NOTICE_KINDS = setOf("model_switch", "async_delegation_complete", "process_complete", "auto_continue", "personality_switch", "failed_turn")
+private val LEGACY_HEARTBEAT = Regex("^\\[Background process \\S+ heartbeat #\\d+ ")
+
+/** null: an ordinary message you wrote. "": hide it. Otherwise the one-line system note to show instead. */
+internal fun machineNote(kind: String?, text: String, meta: kotlinx.serialization.json.JsonElement?): String? {
+    val md = when (meta) {
+        is JsonObject -> meta
+        is JsonPrimitive -> meta.contentOrNull?.let { runCatching { Jsonx.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+        else -> null
+    }
+    val shown = md?.sn("display_text")?.takeIf { it.isNotBlank() }
+    val count = md?.get("task_count")?.let { (it as? JsonPrimitive)?.contentOrNull?.toIntOrNull() }
+    val t = text.trimStart()
+    return when {
+        kind == "hidden" -> ""
+        kind == "model_switch" -> "Model changed"
+        kind == "auto_continue" -> "Resumed interrupted turn"
+        kind == "personality_switch" -> "Personality changed"
+        kind == "failed_turn" -> shown ?: "The turn failed"
+        kind == "process_complete" -> shown ?: "Background process finished"
+        kind == "async_delegation_complete" || t.startsWith("[ASYNC DELEGATION") -> shown ?: (count ?: Regex("— (\\d+) subagent").find(t)?.groupValues?.get(1)?.toIntOrNull())
+            ?.let { "$it background agent${if (it == 1) "" else "s"} finished" } ?: "Background agent work finished"
+        kind in NOTICE_KINDS -> shown ?: "Hermes note"
+        // older Hermes builds store these untyped
+        t.startsWith("[IMPORTANT: ") && t.contains("background process", ignoreCase = true) -> "Background process finished"
+        LEGACY_HEARTBEAT.containsMatchIn(t) -> ""
+        else -> null
+    }
+}
+
+/** A JSON-RPC error frame from Hermes: the server answered, so the call is never retried. */
+class RpcError(val code: Int, msg: String) : java.io.IOException(msg)
+
+/** Window-owned bridges only a Desktop window showing the chat can answer; everyone else declines with 4404. */
+private val WINDOW_ONLY_ASKS = setOf("preview.read", "preview.act", "terminal.read", "window.read", "tour", "display.install.sudo")
+/** Server requests this app can actually answer. */
+private val KNOWN_ASKS = setOf("approval", "clarify", "sudo", "secret", "vault.unlock_prompt", "vault.code")
+/** Reads that are safe to repeat after a dropped socket. */
+private val RETRYABLE = setOf("session.history", "config.get", "model.options", "commands.catalog", "complete.slash", "complete.path",
+    "subagent.list", "subagent.tail", "ping", "session.usage", "session.resume", "session.create")
+
 class Gateway(private val api: Api, private val store: Store) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var ws: WebSocket? = null
@@ -74,7 +120,13 @@ class Gateway(private val api: Api, private val store: Store) {
     /** Calls that look the chat up in a profile's own store; without `profile` a non-default profile's chat isn't found. */
     private val PROFILE_AWARE = setOf("session.create", "session.resume", "session.history", "message.react", "config.get", "config.set",
         "complete.path", "complete.slash", "commands.catalog", "session.title", "session.usage", "session.compress")
-    private val LIVE_EVENTS = setOf("message.delta", "reasoning.delta", "thinking.delta", "tool.generating", "tool.start", "subagent.progress", "status.update")
+    /**
+     * The session source Hermes records. Any client but desktop gets the same toolsets, and "tui" would add a
+     * prompt hint that MEDIA: tags don't render (they do here), so we identify as "mobile", like hermes-go.
+     */
+    private val SOURCE = "mobile"
+    private val TURN_STARTERS = setOf("prompt.submit", "command.dispatch", "slash.exec", "session.steer", "session.compress", "prompt.btw")
+    private val LIVE_EVENTS = setOf("message.delta", "reasoning.delta", "tool.generating", "tool.start", "message.interim")
     val status = MutableStateFlow("")
     val title = MutableStateFlow("New chat")
     val model = MutableStateFlow("")
@@ -236,10 +288,13 @@ class Gateway(private val api: Api, private val store: Store) {
     }
 
     /** One retry across a reconnect for calls that are safe to repeat. */
+    /** Set when this phone asked for the next turn, so a turn Hermes starts itself can be told apart. */
+    @Volatile private var ownTurnAt = 0L
     suspend fun rpc(method: String, params: JsonObject = JsonObject(emptyMap())): JsonObject {
-        val safe = method != "prompt.submit" && method != "slash.exec" && method != "command.dispatch"
+        if (method in TURN_STARTERS) ownTurnAt = now()
         return try { rpcRaw(method, params) } catch (e: java.io.IOException) {
-            if (!safe || !wanted) throw e
+            // only a lost reply on a repeatable call is retried; an error the server sent is final
+            if (e is RpcError || method !in RETRYABLE || !wanted) throw e
             delay(400); rpcRaw(method, params)
         }
     }
@@ -253,7 +308,7 @@ class Gateway(private val api: Api, private val store: Store) {
         val sent = if (prof.isNotBlank() && method in PROFILE_AWARE && params["profile"] == null) JsonObject(params + ("profile" to JsonPrimitive(prof))) else params
         val frame = jsonOf("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to sent)
         if (ws?.send(frame.toString()) != true) { pending.remove(id); throw java.io.IOException("Not connected") }
-        return withTimeout(120_000) { d.await() }
+        return try { withTimeout(120_000) { d.await() } } finally { pending.remove(id) }
     }
 
     private fun handle(m: JsonObject) {
@@ -262,19 +317,27 @@ class Gateway(private val api: Api, private val store: Store) {
             method == "event" -> onEvent(m.o("params") ?: return)
             method.isNotBlank() && m["id"] != null -> {
                 val p = m.o("params") ?: JsonObject(emptyMap())
-                asks.update { it + ServerAsk(m["id"]!!, method, p) }
+                when (method) {
+                    in WINDOW_ONLY_ASKS -> replyError(m["id"]!!, 4404, "not shown")
+                    in KNOWN_ASKS -> asks.update { it + ServerAsk(m["id"]!!, method, p) }
+                    else -> replyError(m["id"]!!, -32601, "Not supported on Talaria")
+                }
             }
             m["id"] != null -> {
                 val id = m.s("id")
                 val d = pending.remove(id) ?: return
                 val err = m.o("error")
-                if (err != null) d.completeExceptionally(java.io.IOException(err.s("message").ifBlank { "Request failed" }))
+                if (err != null) d.completeExceptionally(RpcError(err.l("code").toInt(), err.s("message").ifBlank { "Request failed" }))
                 else d.complete(m.o("result") ?: JsonObject(emptyMap()))
             }
         }
     }
 
     private fun mine(sid: String) = sid.isBlank() || sid == runtimeSid
+
+    private fun replyError(id: JsonElement, code: Int, msg: String) {
+        ws?.send(buildJsonObject { put("jsonrpc", "2.0"); put("id", id); put("error", buildJsonObject { put("code", code); put("message", msg) }) }.toString())
+    }
 
     private fun onEvent(p: JsonObject) {
         val type = p.s("type")
@@ -302,6 +365,9 @@ class Gateway(private val api: Api, private val store: Store) {
     var turnStart = 0L
         private set
     private var usageOutAtStart = 0L
+    /** Whether usage was known when the turn began; a delta against an unknown baseline is the whole session's output. */
+    private var usageKnownAtStart = false
+    private fun markUsageBase() { usageOutAtStart = outOf(usage.value); usageKnownAtStart = usage.value != null }
     private fun outOf(u: JsonObject?): Long = u?.let { maxOf(it.l("output"), it.l("output_tokens"), it.l("completion_tokens")) } ?: 0L
     private fun now() = System.currentTimeMillis()
     private fun ChatItem.Assistant.ended() = if (streaming || endMs == 0L) copy(streaming = false, endMs = now()) else copy(streaming = false)
@@ -321,12 +387,29 @@ class Gateway(private val api: Api, private val store: Store) {
 
     private fun onSessionEvent(type: String, pl: JsonObject) {
         // any sign of life from a running turn means it's still running (keeps Stop available across multi-step turns)
-        if (type in LIVE_EVENTS && !busy.value) { busy.value = true; if (turnStart == 0L) turnStart = now() }
+        if (type in LIVE_EVENTS && !busy.value) {
+            // a turn whose message.start we missed: open a fresh turn so its stats don't absorb the previous one's
+            busy.value = true
+            if (turnStart == 0L) {
+                turnStart = now(); markUsageBase()
+                markServerTurn()
+            }
+        }
         when (type) {
             "btw.complete" -> items.update { it + ChatItem.Output(k("o"), "btw · " + pl.s("question").take(60), pl.s("text")) }
-            "message.start" -> { busy.value = true; turnStart = now(); usageOutAtStart = outOf(usage.value); ensureAssistant() }
-            "message.delta" -> { val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(text = it.text + t) } }
-            "reasoning.delta", "thinking.delta" -> { val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(reasoning = it.reasoning + t) } }
+            "message.start" -> {
+                val wasIdle = !busy.value
+                busy.value = true
+                // message.start can repeat inside one turn; only a turn that was idle restarts the clock
+                if (wasIdle || turnStart == 0L) { turnStart = now(); markUsageBase() }
+                // nobody here asked for this turn (a background agent, process, loop or heartbeat): mark where it begins
+                if (wasIdle) markServerTurn()
+                ensureAssistant()
+            }
+            "message.delta" -> { if (status.value.isNotEmpty()) status.value = ""; val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(text = it.text + t) } }
+            "reasoning.delta" -> { status.value = ""; val i = ensureAssistant(); val t = pl.s("text"); mutate(i) { (it as ChatItem.Assistant).got(t).copy(reasoning = it.reasoning + t) } }
+            // spinner frames and "waiting for provider" notices, not reasoning: they only drive the status line
+            "thinking.delta" -> if (busy.value) status.value = pl.s("text").trim()
             "reasoning.available" -> {
                 // providers that don't stream thinking hand it over whole
                 val t = pl.s("text"); if (t.isNotBlank()) { val i = ensureAssistant(); mutate(i) { a -> (a as ChatItem.Assistant).let { if (it.reasoning.isBlank()) it.copy(reasoning = t) else it } } }
@@ -351,7 +434,13 @@ class Gateway(private val api: Api, private val store: Store) {
                 val key = "t-" + pl.s("tool_id")
                 items.update { l -> l.map { if (it is ChatItem.Tool && it.key == key) it.copy(done = true, summary = pl.s("summary"), duration = pl.d("duration_s"), endMs = now()) else it } }
             }
-            "status.update" -> status.value = pl.s("text")
+            "status.update" -> when (pl.s("kind")) {
+                "compacting", "compressing" -> status.value = "Compressing…"
+                "compacted", "ready" -> if (!busy.value || status.value == "Compressing…") status.value = ""
+                // a background process is about to report back: name the turn it starts after it
+                "process" -> serverTurnLabel = pl.s("text").trim().takeIf { it.isNotBlank() }
+                else -> if (busy.value) status.value = pl.s("text")
+            }
             "message.reaction" -> applyReactions(pl.l("row_id"), parseReactions(pl["reactions"]), pl.s("role"))
             "session.usage" -> usage.value = pl.o("usage")
             "session.title" -> title.value = pl.s("title").ifBlank { title.value }
@@ -361,14 +450,18 @@ class Gateway(private val api: Api, private val store: Store) {
                 val i = lastStreaming()
                 val reused = pl.b("response_reused")
                 pl.o("usage")?.let { usage.value = it }
+                val turnFrom0 = items.value.indexOfLast { it.startsTurn() } + 1
+                val estOut = items.value.drop(turnFrom0).filterIsInstance<ChatItem.Assistant>().sumOf { (it.chars + it.reasoning.length) / 4L }
+                // trust the usage delta only against a known baseline and when it's in the same league as what streamed
                 val turnOut = (outOf(usage.value) - usageOutAtStart).coerceAtLeast(0)
+                    .takeIf { usageKnownAtStart && it <= maxOf(estOut * 6, estOut + 8_000) } ?: 0L
                 val why = pl.sn("reasoning").orEmpty()
                 if (i >= 0) mutate(i) { a -> (a as ChatItem.Assistant).ended().let { it.copy(text = if (it.text.isBlank() && !reused) text else it.text, reasoning = it.reasoning.ifBlank { why }) } }
                 if (i < 0 && text.isNotBlank() && !reused && items.value.lastOrNull().let { it !is ChatItem.Assistant || it.text != text }) {
                     items.update { it + whole(text) }
                 }
                 // every reply in this turn carries the turn's exact output tokens (stats aggregate per turn)
-                val turnFrom = items.value.indexOfLast { it is ChatItem.User } + 1
+                val turnFrom = items.value.indexOfLast { it.startsTurn() } + 1
                 items.update { l -> l.mapIndexed { n, it ->
                     if (n >= turnFrom && it is ChatItem.Assistant) {
                         val a = if (turnOut > 0) it.copy(outTokens = turnOut) else it
@@ -398,11 +491,104 @@ class Gateway(private val api: Api, private val store: Store) {
                 lastOutcome.value = Outcome(st.ifBlank { "complete" }, items.value.lastOrNull { it is ChatItem.Assistant && it.text.isNotBlank() }.let { (it as? ChatItem.Assistant)?.text.orEmpty() }, now())
                 busy.value = false
                 status.value = ""
-                turnStart = 0L
-                if (items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() }) scope.launch { runCatching { syncRowIds() } }
+                // the turn is over: the next one (yours, or one Hermes starts) times and counts from scratch
+                turnStart = 0L; markUsageBase()
+                val serverTurn = serverTurnKey
+                serverTurnKey = null
+                if (serverTurn != null || items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() })
+                    scope.launch { runCatching { reconcile(serverTurn) } }
             }
             "error" -> { items.update { it + ChatItem.Notice(k("n"), pl.s("message"), true) }; busy.value = false; status.value = "" }
         }
+    }
+
+    /** Text of the last `status.update{kind:"process"}`, used to label the turn Hermes starts next. */
+    private var serverTurnLabel: String? = null
+    /** Key of the boundary row for a turn Hermes started itself, fixed up from history once the turn ends. */
+    private var serverTurnKey: String? = null
+
+    private fun markServerTurn() {
+        if (now() - ownTurnAt < 15_000) return
+        val last = items.value.lastOrNull() ?: return
+        if (!(last is ChatItem.Assistant || last is ChatItem.Tool || (last is ChatItem.Notice && !last.boundary) || last is ChatItem.Output)) return
+        val key = k("n")
+        items.update { it + ChatItem.Notice(key, serverTurnLabel ?: "Hermes picked this up", boundary = true) }
+        serverTurnLabel = null
+        serverTurnKey = key
+    }
+
+    /** End the turn without a message.complete (muted notification turns, or a missed terminal frame). */
+    private fun settleTurn() {
+        busy.value = false; status.value = ""
+        items.update { l -> l.map {
+            when {
+                it is ChatItem.Assistant && it.streaming -> it.ended()
+                it is ChatItem.Tool && !it.done -> it.copy(done = true, endMs = now())
+                else -> it
+            }
+        }.filterNot { it is ChatItem.Assistant && it.text.isBlank() && it.reasoning.isBlank() } }
+        turnStart = 0L; markUsageBase()
+        val serverTurn = serverTurnKey; serverTurnKey = null
+        scope.launch { runCatching { reconcile(serverTurn) } }
+    }
+
+    /**
+     * After a turn: learn durable row ids, and replace the live label on a turn Hermes started itself with
+     * what history says it was (a hidden heartbeat wake vanishes, a /loop prompt becomes your message).
+     */
+    private suspend fun reconcile(boundaryKey: String?) {
+        if (boundaryKey != null && runtimeSid.isNotBlank()) {
+            val hist = rpc("session.history", jsonOf("session_id" to runtimeSid)).a("messages").objs()
+            val u0 = hist.lastOrNull { it.s("role") == "user" }
+            // the turn's own row may be hidden (dropped from history): then the newest row is one we already show
+            val known = items.value.filterIsInstance<ChatItem.User>()
+            val maxRow = known.mapNotNull { it.rowId }.maxOrNull() ?: 0L
+            val stale = u0 != null && ((u0.l("row_id") in 1..maxRow) || (maxRow == 0L && known.lastOrNull()?.raw?.trim() == u0.s("text").trim()))
+            val u = if (stale) null else u0
+            if (u0 != null && u == null) items.update { l -> l.map { if (it.key == boundaryKey) ChatItem.Notice(it.key, "", boundary = true) else it } }
+            if (u != null) {
+                val txt = u.s("text").ifBlank { (u["content"] as? JsonPrimitive)?.contentOrNull ?: "" }
+                val note = machineNote(u.sn("display_kind"), txt, u["display_metadata"])
+                items.update { l -> l.mapNotNull {
+                    if (it.key != boundaryKey) it
+                    else when {
+                        note == null && txt.isNotBlank() -> userFromHistory(u, txt, -1)
+                        note.isNullOrEmpty() -> ChatItem.Notice(it.key, "", boundary = true)   // keeps the turn split, draws nothing
+                        else -> (it as ChatItem.Notice).copy(text = note)
+                    }
+                } }
+            }
+        }
+        if (items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() }) syncRowIds()
+    }
+
+    private val ATTACH_LINE = Regex("^@(image|file|folder):(\\S.*)$")
+
+    /** A stored user row as a bubble: leading @file refs and trailing @image refs become chips, `raw` keeps the original. */
+    private fun userFromHistory(m: JsonObject, txt: String, ord: Int): ChatItem.User {
+        val lines = txt.lines()
+        val files = mutableListOf<Attachment>()
+        var from = 0
+        while (from < lines.size) {
+            val l = lines[from].trim()
+            if (l.isEmpty()) { from++; continue }
+            // "@file:a @file:b" on one line is how this app sends several
+            val toks = l.split(Regex("\\s+"))
+            if (toks.all { ATTACH_LINE.matches(it) }) {
+                toks.forEach { t -> ATTACH_LINE.find(t)!!.groupValues.let { g -> files += Attachment(g[2].substringAfterLast('/').trim('`', '"'), if (g[1] == "image") "image" else "file", path = g[2], ref = t) } }
+                from++
+            } else break
+        }
+        var to = lines.size
+        while (to > from) {
+            val l = lines[to - 1].trim()
+            if (l.isEmpty()) { to--; continue }
+            val g = ATTACH_LINE.find(l)?.groupValues ?: break
+            if (g[1] != "image") break
+            files += Attachment(g[2].substringAfterLast('/'), "image", path = g[2]); to--
+        }
+        val shown = if (files.isEmpty()) txt else lines.subList(from, to).joinToString("\n").trim()
+        return ChatItem.User(k("u"), shown, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, ord, files, reactions = parseReactions(m["display_metadata"]))
     }
 
     // ── public chat API ──────────────────────────────────────────────────────
@@ -422,15 +608,27 @@ class Gateway(private val api: Api, private val store: Store) {
             when (m.s("role")) {
                 "user" -> {
                     val o = ord++
-                    turnTs = ts; firstStep = true
-                    if (m.s("display_kind") != "hidden" && txt.isNotBlank()) list += ChatItem.User(k("u"), txt, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, o, reactions = parseReactions(m["display_metadata"]))
+                    if (m.sn("display_kind") != "steer") { turnTs = ts; firstStep = true }
+                    val kind = m.sn("display_kind")
+                    val note = machineNote(kind, txt, m["display_metadata"])
+                    when {
+                        // a mid-turn correction: part of the turn it steered, not a new one
+                        kind == "steer" -> list += ChatItem.Notice(k("n"), "↪ Steered: " + txt.take(120))
+                        note != null -> list += ChatItem.Notice(k("n"), note, boundary = true)   // "" still splits the turn, draws nothing
+                        txt.isNotBlank() -> list += userFromHistory(m, txt, o)
+                    }
                 }
-                "assistant" -> if (txt.isNotBlank()) {
+                "assistant" -> if (m.sn("display_kind") == "failed_turn") {
+                    val md = (m["display_metadata"] as? JsonObject) ?: (m["display_metadata"] as? JsonPrimitive)?.contentOrNull?.let { runCatching { Jsonx.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+                    list += ChatItem.Notice(k("n"), md?.sn("error")?.takeIf { it.isNotBlank() } ?: md?.o("error_surface")?.sn("message") ?: txt.ifBlank { "The turn failed" }, error = true)
+                } else if (txt.isNotBlank()) {
                     val a = StatsCache.restore(ChatItem.Assistant(k("a"), txt, m.s("reasoning"),
                         rowId = m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, reactions = parseReactions(m["display_metadata"])))
                     // no phone-side timing: mark the turn's span from server timestamps (no fake token stats)
                     list += if (a.firstMs > 0 || ts <= 0) a else a.copy(startMs = if (firstStep && turnTs in 1..ts) turnTs else 0, endMs = ts)
                     firstStep = false
+                    val md = m["display_metadata"] as? JsonObject
+                    if (md?.b("interrupted") == true) list += ChatItem.Notice(k("n"), "Stopped")
                 }
                 "tool" -> {
                     list += ChatItem.Tool(k("t"), m.s("name").ifBlank { "tool" }, m.s("context"), true,
@@ -450,16 +648,21 @@ class Gateway(private val api: Api, private val store: Store) {
                 ?: (inf?.o("user"))?.s("text")?.takeIf { it.isNotBlank() }
                 ?: if (sameChat) (items.value.lastOrNull { it is ChatItem.User } as? ChatItem.User)?.text else null
             val lastHist = list.lastOrNull { it is ChatItem.User } as? ChatItem.User
-            if (pending != null && pending.trim() != lastHist?.text?.trim()) {
+            val pendingNote = pending?.let { machineNote(inf?.sn("display_kind") ?: inf?.o("user")?.sn("display_kind"), it, inf?.get("display_metadata")) }
+            if (pendingNote != null) {
+                if (pendingNote.isNotEmpty() && (list.lastOrNull { it.startsTurn() } as? ChatItem.Notice)?.text != pendingNote) list += ChatItem.Notice(k("n"), pendingNote, boundary = true)
+            } else if (pending != null && pending.trim() != lastHist?.text?.trim()) {
                 val mine = if (!sameChat) null else items.value.lastOrNull { it is ChatItem.User && it.text.trim() == pending.trim() } as? ChatItem.User
                 list += mine?.copy(ordinal = ord) ?: ChatItem.User(k("u"), pending, pending, null, ord)
                 ord++
             }
             // time the turn from when the server started it, not from when we reconnected
             turnStart = serverTime(r["turn_started_at"] ?: r.o("info")?.get("turn_started_at")) ?: turnStart.takeIf { it > 0 } ?: now()
+            // joined mid-turn: the session usage already includes part of this turn, so its delta can't be trusted
+            usageKnownAtStart = false
             // steps of this turn already in history: drop any cached timings (a short line like "Let me check."
             // can match an older turn's) and anchor the live block on the turn's real start
-            val from = list.indexOfLast { it is ChatItem.User } + 1
+            val from = list.indexOfLast { it.startsTurn() } + 1
             var anchored = false
             for (j in from until list.size) {
                 val it = list[j]
@@ -480,7 +683,12 @@ class Gateway(private val api: Api, private val store: Store) {
         if (running) busy.value = true
         // questions that were waiting for us while we were away
         val waiting = mutableListOf<ServerAsk>()
-        r.a("open_requests").objs().forEach { q -> q["id"]?.let { waiting += ServerAsk(it, q.s("method"), q.o("params") ?: JsonObject(emptyMap())) } }
+        r.a("open_requests").objs().forEach { q -> q["id"]?.let { id ->
+            when (q.s("method")) {
+                in KNOWN_ASKS -> waiting += ServerAsk(id, q.s("method"), q.o("params") ?: JsonObject(emptyMap()))
+                in WINDOW_ONLY_ASKS -> replyError(id, 4404, "not shown")
+            }
+        } }
         r.o("pending_approval")?.let { pa ->
             val rid = pa.s("request_id")
             if (waiting.none { it.method == "approval" }) waiting += ServerAsk(JsonPrimitive("resume-approval:$rid"), "approval", pa)
@@ -520,6 +728,12 @@ class Gateway(private val api: Api, private val store: Store) {
         pl["yolo"]?.let { yolo.value = pl.b("yolo") }
         fastFromInfo(pl)?.let { fast.value = it }
         if (pl.b("running") && busy.value) serverTime(pl["turn_started_at"])?.let { if (turnStart == 0L || it < turnStart) turnStart = it }
+        // compression moves the chat onto a new stored id mid-session
+        pl.sn("stored_session_id")?.takeIf { it.isNotBlank() }?.let { storedSid = it }
+        // cumulative counters for the live agent: the real baseline for per-turn token stats
+        pl.o("usage")?.let { usage.value = it }
+        // the server's word that the turn is over, sent even when a muted turn emitted no message.complete
+        if (pl["running"] != null && !pl.b("running") && busy.value && now() - ownTurnAt > 2_000 && status.value != "Stopping…") settleTurn()
         pl.sn("reasoning_effort")?.let { if (it.isNotBlank()) reasoning.value = it }
         // the agent is built now: carry your saved speed into this chat once (settings sent before the build are dropped)
         val built = pl.sn("model").orEmpty().isNotBlank() && !pl.b("lazy")
@@ -537,10 +751,10 @@ class Gateway(private val api: Api, private val store: Store) {
     /** Resume that builds the agent up front (so per-chat settings stick), falling back for older servers. */
     private suspend fun resumeRpc(stored: String): JsonObject {
         fastAssertFor = ""
-        return try { rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "inline_images" to false, "eager_build" to true)) }
+        return try { rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "source" to SOURCE, "inline_images" to false, "eager_build" to true)) }
         catch (e: java.io.IOException) {
             if (!e.message.orEmpty().contains("eager_build")) throw e
-            rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "inline_images" to false))
+            rpc("session.resume", jsonOf("session_id" to stored, "cols" to 80, "source" to SOURCE, "inline_images" to false))
         }
     }
 
@@ -624,8 +838,10 @@ class Gateway(private val api: Api, private val store: Store) {
             val p = store.profile.value
             fastAssertFor = ""
             // the speed rides on create itself; a config.set before the agent is built would be dropped
-            val r = try { rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null }, "fast" to (if (store.fastPref.value) true else null))) }
-                catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null })) }
+            // one key per new chat, so a retry after a lost reply can't mint a second session
+            val idem = java.util.UUID.randomUUID().toString()
+            val r = try { rpc("session.create", jsonOf("cols" to 80, "source" to SOURCE, "profile" to p.ifBlank { null }, "fast" to (if (store.fastPref.value) true else null), "idempotency_key" to idem)) }
+                catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", jsonOf("cols" to 80, "source" to SOURCE, "profile" to p.ifBlank { null }, "idempotency_key" to idem)) }
             storedSid = r.s("stored_session_id")
             store.markMine(storedSid)
             applySnapshot(r)
@@ -643,7 +859,7 @@ class Gateway(private val api: Api, private val store: Store) {
         } finally { loadingSession.value = false }
     }
 
-    suspend fun send(text: String) {
+    suspend fun send(text: String, queue: Boolean = busy.value) {
         if (runtimeSid.isBlank()) newChat()
         val staged = attachments.value
         attachments.value = emptyList()
@@ -656,7 +872,8 @@ class Gateway(private val api: Api, private val store: Store) {
         items.update { it + ChatItem.User(key, if (staged.isNotEmpty()) text else shown.ifBlank { body }, body, null, ord, staged) }
         busy.value = true
         try {
-            val r = rpc("prompt.submit", jsonOf("session_id" to runtimeSid, "text" to body))
+            // queued: "run after this turn", never a live correction that would interrupt the running reply
+            val r = rpc("prompt.submit", jsonOf("session_id" to runtimeSid, "text" to body, "queued" to (if (queue) true else null)))
             val row = r.l("user_row_id")
             if (row > 0) items.update { l -> l.map { if (it is ChatItem.User && it.key == key) it.copy(rowId = row) else it } }
         } catch (e: Exception) {
@@ -703,12 +920,16 @@ class Gateway(private val api: Api, private val store: Store) {
 
     suspend fun modelOptions(): JsonObject = rpc("model.options", jsonOf("session_id" to runtimeSid.ifBlank { null }))
 
-    suspend fun setModel(modelId: String, provider: String) {
+    /** Returns Hermes' confirmation question when it wants a yes first (price, context loss); nothing switched yet. */
+    suspend fun setModel(modelId: String, provider: String, confirmed: Boolean = false): String? {
         if (runtimeSid.isBlank()) newChat()
         val v = buildString { append(modelId); if (provider.isNotBlank()) append(" --provider ").append(provider); append(" --session") }
-        rpc("config.set", jsonOf("key" to "model", "session_id" to runtimeSid, "value" to v))
-        model.value = modelId
-        items.update { it + ChatItem.Notice(k("n"), "Switched to $modelId") }
+        val r = rpc("config.set", jsonOf("key" to "model", "session_id" to runtimeSid, "value" to v, "confirm_expensive_model" to (if (confirmed) true else null)))
+        if (r.b("confirm_required")) return r.sn("confirm_message")?.takeIf { it.isNotBlank() } ?: "Switch to $modelId?"
+        if (r.b("deferred")) items.update { it + ChatItem.Notice(k("n"), "Switches to $modelId after this reply") }
+        else { model.value = modelId; items.update { it + ChatItem.Notice(k("n"), "Switched to $modelId") } }
+        r.sn("warning")?.takeIf { it.isNotBlank() }?.let { w -> items.update { it + ChatItem.Notice(k("n"), w) } }
+        return null
     }
 
     suspend fun setYolo(on: Boolean) {
@@ -752,7 +973,7 @@ class Gateway(private val api: Api, private val store: Store) {
                 val next = queued.value.firstOrNull() ?: return@collect
                 if (busy.value) return@collect
                 queued.update { it.drop(1) }
-                send(next)
+                send(next, queue = true)
             }
         }
     }

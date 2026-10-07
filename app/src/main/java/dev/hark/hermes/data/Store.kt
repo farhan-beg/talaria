@@ -28,15 +28,32 @@ data class AuthState(
 
 /** Encrypted persistence for the server URL and bearer tokens. */
 class Store(context: Context) {
-    private val prefs: SharedPreferences = try {
+    /** True when the Android keystore couldn't open encrypted storage and tokens sit in plain app storage. */
+    var insecure = false
+        private set
+
+    private fun openEncrypted(context: Context): SharedPreferences {
         val key = MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
-        EncryptedSharedPreferences.create(
+        return EncryptedSharedPreferences.create(
             context, "hermes_secure", key,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
+    }
+
+    private val prefs: SharedPreferences = try {
+        openEncrypted(context)
     } catch (e: Exception) {
-        context.getSharedPreferences("hermes_plain", Context.MODE_PRIVATE)
+        // usually a keystore key lost after a restore or OS update: the old file can't be read, so start
+        // it fresh (you sign in again) rather than dropping tokens into plain storage
+        try {
+            context.deleteSharedPreferences("hermes_secure")
+            openEncrypted(context)
+        } catch (e2: Exception) {
+            android.util.Log.w("Talaria", "Encrypted storage unavailable; using plain app storage")
+            insecure = true
+            context.getSharedPreferences("hermes_plain", Context.MODE_PRIVATE)
+        }
     }
 
     private val _auth = MutableStateFlow(load())

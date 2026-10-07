@@ -294,7 +294,13 @@ fun FileChips(paths: List<String>) {
 fun ChatImage(src: String) {
     val p = LocalPalette.current
     val isWeb = src.startsWith("http://") || src.startsWith("https://")
-    val bmp by produceState<Bitmap?>(null, src) {
+    // a link to anywhere but your own Hermes server waits for a tap: a reply can't make the phone fetch
+    // arbitrary URLs (tracking pixels, addresses on your network) just by mentioning them
+    val ownHost = remember { app.api.base.substringAfter("://").substringBefore('/').substringBefore(':').lowercase() }
+    val srcHost = if (isWeb) src.substringAfter("://").substringBefore('/').substringBefore(':').substringAfter('@').lowercase() else ""
+    var allowed by remember(src) { mutableStateOf(!isWeb || (srcHost.isNotBlank() && srcHost == ownHost)) }
+    val bmp by produceState<Bitmap?>(null, src, allowed) {
+        if (!allowed) return@produceState
         value = runCatching {
             val bytes = if (isWeb) app.api.fetchUrl(src) else loadFile(FileReq(src.removePrefix("file://"))).first
             withContext(Dispatchers.Default) {
@@ -307,10 +313,16 @@ fun ChatImage(src: String) {
     }
     val ctx = LocalContext.current
     Box(Modifier.padding(vertical = 4.dp).fillMaxWidth().heightIn(min = 120.dp, max = 360.dp).clip(RoundedCornerShape(16.dp)).background(p.accentSoft.copy(alpha = 0.5f))
-        .clickable { if (isWeb) runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(src))) } else FileOpen.open(src.removePrefix("file://")) },
+        .clickable {
+            if (!allowed) allowed = true
+            else if (isWeb) runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(src))) } else FileOpen.open(src.removePrefix("file://"))
+        },
         contentAlignment = Alignment.Center) {
         bmp?.let { Image(it.asImageBitmap(), null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth()) }
-            ?: Icon(Icons.Outlined.Image, null, tint = p.faint, modifier = Modifier.size(32.dp))
+            ?: if (!allowed) Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(Icons.Outlined.Image, null, tint = p.faint, modifier = Modifier.size(32.dp))
+                Text("Tap to load image from $srcHost", color = p.muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 6.dp, start = 12.dp, end = 12.dp))
+            } else Icon(Icons.Outlined.Image, null, tint = p.faint, modifier = Modifier.size(32.dp))
     }
 }
 

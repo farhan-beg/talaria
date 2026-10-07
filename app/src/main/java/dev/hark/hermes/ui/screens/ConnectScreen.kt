@@ -186,6 +186,13 @@ fun ConnectScreen() {
             }
         }
 
+        if (url.isNotBlank() && dev.hark.hermes.data.isInsecureUrl(app.api.normalize(url))) {
+            Spacer(Modifier.height(14.dp))
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.bad.copy(alpha = 0.1f)).padding(12.dp)) {
+                Icon(Icons.Outlined.LockOpen, null, tint = p.bad); Spacer(Modifier.width(8.dp))
+                Text("This is plain http to a public address, so your password and chats travel unencrypted. Use https, or a LAN or Tailscale address.", color = p.ink, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
         err?.let {
             Spacer(Modifier.height(14.dp))
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.bad.copy(alpha = 0.1f)).padding(12.dp)) {

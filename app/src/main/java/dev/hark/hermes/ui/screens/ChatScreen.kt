@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 object ChatNav { val pendingResume = MutableStateFlow<Pair<String, String?>?>(null) }
 
@@ -614,7 +615,7 @@ private fun ChatRow(item: ChatItem, canRegen: Boolean = false, stats: TurnStats?
             Spacer(Modifier.height(8.dp))
             SelectionContainer { Text(item.text, color = p.ink, fontFamily = Mono, style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.5.sp, lineHeight = 18.sp)) }
         }
-        is ChatItem.Notice -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+        is ChatItem.Notice -> if (item.text.isNotEmpty()) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
             Text(item.text, color = if (item.error) p.bad else p.muted, style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.clip(RoundedCornerShape(50)).background((if (item.error) p.bad else p.muted).copy(alpha = 0.1f)).padding(horizontal = 12.dp, vertical = 6.dp))
         }
@@ -660,21 +661,38 @@ private fun AskCard(ask: ServerAsk) {
             "clarify" -> {
                 val qs = pr.a("questions").objs()
                 val answers = remember(ask) { mutableStateMapOf<String, String>() }
+                val multi = remember(ask) { mutableMapOf<String, androidx.compose.runtime.snapshots.SnapshotStateList<String>>() }
                 Text("Hermes has a question", style = MaterialTheme.typography.titleSmall, color = p.ink)
                 qs.forEach { q ->
                     Spacer(Modifier.height(8.dp))
                     Text(q.s("question"), color = p.ink, style = MaterialTheme.typography.bodyMedium)
-                    val ch = q.a("choices").strs()
-                    if (ch.isNotEmpty()) {
+                    // Hermes marks its pick "(recommended)"; the answer is the bare choice
+                    val ch = q.a("choices").strs().map { it.replace(Regex("\\s*\\((recommended|Recommended)\\)\\s*$"), "") }
+                    val qid = q.s("qid")
+                    if (ch.isNotEmpty() && q.b("multi_select")) {
                         Spacer(Modifier.height(6.dp))
-                        ChipRow(ch.map { it to it }, answers[q.s("qid")] ?: "") { answers[q.s("qid")] = it }
+                        val picked = multi.getOrPut(qid) { mutableStateListOf() }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                            ch.forEach { c ->
+                                SoftButton((if (c in picked) "✓ " else "") + c, primary = c in picked) { if (c in picked) picked.remove(c) else picked.add(c) }
+                            }
+                        }
+                    } else if (ch.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        ChipRow(ch.map { it to it }, answers[qid] ?: "") { answers[qid] = it }
                     }
                     Spacer(Modifier.height(6.dp))
                     Field("Answer", answers[q.s("qid")] ?: "", { answers[q.s("qid")] = it })
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SoftButton("Send", primary = true) { g.answer(ask, jsonOf("answers" to qs.associate { it.s("qid") to answers[it.s("qid")] })) }
+                    SoftButton("Send", primary = true) {
+                        g.answer(ask, jsonOf("answers" to qs.associate { q ->
+                            val id = q.s("qid"); val typed = answers[id].orEmpty().trim()
+                            // multi-select answers go back as a JSON array of the picks (plus anything typed)
+                            id to if (q.b("multi_select")) kotlinx.serialization.json.JsonArray(((multi[id] ?: emptyList<String>()) + listOf(typed).filter { it.isNotEmpty() }).map { JsonPrimitive(it) }).toString() else answers[id]
+                        }))
+                    }
                     SoftButton("Skip") { g.answer(ask, JsonObject(emptyMap())) }
                 }
             }
@@ -721,7 +739,10 @@ private fun NerdStats(a: TurnStats) {
 }
 
 
-/** Reads a picked file's bytes, display name and mime type. */
+/** Largest file the phone will read for an attachment or upload (it goes over as base64 in one request). */
+internal const val MAX_PICK_BYTES = 25L * 1024 * 1024
+
+/** Reads a picked file's bytes, display name and mime type, refusing anything over [MAX_PICK_BYTES] before reading it all. */
 internal fun readUri(ctx: android.content.Context, uri: android.net.Uri): Triple<ByteArray, String, String> {
     val cr = ctx.contentResolver
     var name = uri.lastPathSegment ?: "file"
@@ -729,7 +750,17 @@ internal fun readUri(ctx: android.content.Context, uri: android.net.Uri): Triple
         if (c.moveToFirst()) c.getString(0)?.let { name = it }
     }
     val mime = cr.getType(uri) ?: "application/octet-stream"
-    val bytes = cr.openInputStream(uri)?.use { it.readBytes() } ?: ByteArray(0)
+    var size = -1L
+    runCatching { cr.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c -> if (c.moveToFirst() && !c.isNull(0)) size = c.getLong(0) } }
+    if (size > MAX_PICK_BYTES) throw java.io.IOException("$name is over ${MAX_PICK_BYTES / (1024 * 1024)} MB")
+    // providers can under-report, so the read itself stops at the cap too
+    val bytes = cr.openInputStream(uri)?.use { input ->
+        val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(64 * 1024)
+        while (true) { val n = input.read(buf); if (n < 0) break
+            if (out.size() + n > MAX_PICK_BYTES) throw java.io.IOException("$name is over ${MAX_PICK_BYTES / (1024 * 1024)} MB")
+            out.write(buf, 0, n) }
+        out.toByteArray()
+    } ?: ByteArray(0)
     return Triple(bytes, name, mime)
 }
 
@@ -746,6 +777,16 @@ private fun ModelSheet(onClose: () -> Unit) {
     var query by remember { mutableStateOf("") }
     var switching by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { try { data = g.modelOptions() } catch (e: Exception) { err = errText(e) } }
+    var confirmModel by remember { mutableStateOf<Triple<String, String, String>?>(null) }
+    confirmModel?.let { (m, slug, q) ->
+        AlertDialog(onDismissRequest = { confirmModel = null }, containerColor = p.sheet,
+            title = { Text("Switch to $m?", color = p.ink) }, text = { Text(q, color = p.muted) },
+            confirmButton = { TextButton({
+                confirmModel = null; switching = m
+                scope.launch { try { g.setModel(m, slug, confirmed = true); onClose() } catch (e: Exception) { toast(errText(e)) } finally { switching = null } }
+            }) { Text("Switch", color = p.accent) } },
+            dismissButton = { TextButton({ confirmModel = null }) { Text("Cancel", color = p.muted) } })
+    }
     ModalBottomSheet(onClose, containerColor = p.sheet) {
         Text("This chat", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
         Text("Changes here apply to this conversation only.", style = MaterialTheme.typography.bodySmall, color = p.muted, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
@@ -773,7 +814,8 @@ private fun ModelSheet(onClose: () -> Unit) {
                         .clickable(enabled = switching == null) {
                             switching = m
                             scope.launch {
-                                try { g.setModel(m, row.s("slug")); onClose() } catch (e: Exception) { toast(errText(e)) } finally { switching = null }
+                                try { val ask = g.setModel(m, row.s("slug")); if (ask == null) onClose() else confirmModel = Triple(m, row.s("slug"), ask) }
+                                catch (e: Exception) { toast(errText(e)) } finally { switching = null }
                             }
                         }.padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(m, color = p.ink, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
