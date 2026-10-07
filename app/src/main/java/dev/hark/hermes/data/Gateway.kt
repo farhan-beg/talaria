@@ -137,18 +137,28 @@ class Gateway(private val api: Api, private val store: Store) {
         scope.launch {
             val token = try { api.accessToken() } catch (e: Exception) { "" }
             val req = Request.Builder().url(api.wsUrl("/api/ws", token)).build()
-            ws = api.http.newWebSocket(req, Listener())
+            val gen = ++connGen
+            if (!wanted) return@launch
+            ws?.let { old -> ws = null; old.cancel() }   // its callbacks are now stale and ignored
+            ws = api.http.newWebSocket(req, Listener(gen))
         }
     }
 
     fun disconnect() {
-        wanted = false; retryJob?.cancel(); reconnecting.value = false
+        wanted = false; retryJob?.cancel(); reconnecting.value = false; watchdog?.cancel(); connGen++
         ws?.close(1000, "bye"); ws = null
         conn.value = Conn.Idle
     }
 
-    private inner class Listener : WebSocketListener() {
+    /** Bumped for every socket; callbacks from an older socket are ignored so a late close can't kill a newer link. */
+    @Volatile private var connGen = 0
+    private var watchdog: Job? = null
+
+    private inner class Listener(private val gen: Int) : WebSocketListener() {
+        private fun stale(w: WebSocket) = gen != connGen || (ws != null && ws !== w)
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (stale(webSocket)) { webSocket.close(1000, "superseded"); return }
+            ws = webSocket
             val wasReconnect = reconnecting.value || attempt > 0
             conn.value = Conn.Ready
             connError.value = null
@@ -163,16 +173,30 @@ class Gateway(private val api: Api, private val store: Store) {
                 }
                 reconnecting.value = false
             }
+            // a link can die silently (NAT timeout, captive Wi-Fi): while a turn runs, probe it when it goes quiet
+            watchdog?.cancel()
+            watchdog = scope.launch {
+                while (gen == connGen && conn.value == Conn.Ready) {
+                    delay(15_000)
+                    if (gen != connGen) break
+                    if (busy.value && System.currentTimeMillis() - lastFrameAt > 40_000) {
+                        val ok = runCatching { withTimeout(8_000) { rpcRaw("ping", JsonObject(emptyMap())) } }.isSuccess
+                        if (!ok && gen == connGen) webSocket.cancel()
+                    }
+                }
+            }
         }
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (stale(webSocket)) return
             lastFrameAt = System.currentTimeMillis()
             text.split('\n').filter { it.isNotBlank() }.forEach { line ->
                 runCatching { handle(Jsonx.parseToJsonElement(line).jsonObject) }
             }
         }
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { dropped(if (code == 4401) "Sign-in expired" else null) }
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (stale(webSocket)) return; dropped(if (code == 4401) "Sign-in expired" else null) }
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (stale(webSocket)) return
             dropped(if (response?.code == 401 || response?.code == 403) "Sign-in expired" else (t.message ?: "Connection lost"))
         }
     }
@@ -382,34 +406,76 @@ class Gateway(private val api: Api, private val store: Store) {
     // ── public chat API ──────────────────────────────────────────────────────
 
     private fun applySnapshot(r: JsonObject) {
+        val sameChat = storedSid.isNotBlank() && (r.sn("stored_session_id") ?: storedSid) == storedSid
         runtimeSid = r.s("session_id")
         storedSid = r.sn("stored_session_id") ?: storedSid
         r.o("info")?.let { applyInfo(it) }
         val list = mutableListOf<ChatItem>()
         var ord = 0
+        var turnTs = 0L   // when the current history turn's user message was sent
+        var firstStep = true
         r.a("messages").objs().forEach { m ->
+            val ts = histTime(m["timestamp"])
             val txt = m.s("text").ifBlank { (m["content"] as? JsonPrimitive)?.contentOrNull ?: "" }
             when (m.s("role")) {
                 "user" -> {
                     val o = ord++
+                    turnTs = ts; firstStep = true
                     if (m.s("display_kind") != "hidden" && txt.isNotBlank()) list += ChatItem.User(k("u"), txt, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, o, reactions = parseReactions(m["display_metadata"]))
                 }
-                "assistant" -> if (txt.isNotBlank()) list += StatsCache.restore(ChatItem.Assistant(k("a"), txt, m.s("reasoning"),
-                    rowId = m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, reactions = parseReactions(m["display_metadata"])))
-                "tool" -> list += ChatItem.Tool(k("t"), m.s("name").ifBlank { "tool" }, m.s("context"), true)
+                "assistant" -> if (txt.isNotBlank()) {
+                    val a = StatsCache.restore(ChatItem.Assistant(k("a"), txt, m.s("reasoning"),
+                        rowId = m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, reactions = parseReactions(m["display_metadata"])))
+                    // no phone-side timing: mark the turn's span from server timestamps (no fake token stats)
+                    list += if (a.firstMs > 0 || ts <= 0) a else a.copy(startMs = if (firstStep && turnTs in 1..ts) turnTs else 0, endMs = ts)
+                    firstStep = false
+                }
+                "tool" -> {
+                    list += ChatItem.Tool(k("t"), m.s("name").ifBlank { "tool" }, m.s("context"), true,
+                        startMs = if (firstStep && turnTs in 1..ts) turnTs else ts.coerceAtLeast(0), endMs = ts.coerceAtLeast(0))
+                    firstStep = false
+                }
                 "system" -> {}
             }
         }
         // a turn still running on the server: show what it has said so far and keep streaming into it
         val running = r.b("running") || r.o("info")?.b("running") == true
-        r.o("inflight")?.let { inf ->
-            val partial = inf.s("assistant")
-            if (running && partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = inf.b("streaming") || running, startMs = now())
-            inf.sn("status")?.let { status.value = it }
+        if (running) {
+            // the running turn's own message isn't in history until the turn ends: bring it back from the
+            // server's inflight copy (or what we sent from this phone), so steps attach to the right turn
+            val inf = r.o("inflight")
+            val pending = (inf?.get("user") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                ?: (inf?.o("user"))?.s("text")?.takeIf { it.isNotBlank() }
+                ?: if (sameChat) (items.value.lastOrNull { it is ChatItem.User } as? ChatItem.User)?.text else null
+            val lastHist = list.lastOrNull { it is ChatItem.User } as? ChatItem.User
+            if (pending != null && pending.trim() != lastHist?.text?.trim()) {
+                val mine = if (!sameChat) null else items.value.lastOrNull { it is ChatItem.User && it.text.trim() == pending.trim() } as? ChatItem.User
+                list += mine?.copy(ordinal = ord) ?: ChatItem.User(k("u"), pending, pending, null, ord)
+                ord++
+            }
+            // time the turn from when the server started it, not from when we reconnected
+            turnStart = serverTime(r["turn_started_at"] ?: r.o("info")?.get("turn_started_at")) ?: turnStart.takeIf { it > 0 } ?: now()
+            // steps of this turn already in history: drop any cached timings (a short line like "Let me check."
+            // can match an older turn's) and anchor the live block on the turn's real start
+            val from = list.indexOfLast { it is ChatItem.User } + 1
+            var anchored = false
+            for (j in from until list.size) {
+                val it = list[j]
+                list[j] = when (it) {
+                    is ChatItem.Assistant -> it.copy(startMs = if (!anchored) turnStart else 0, firstMs = 0, endMs = 0).also { anchored = true }
+                    is ChatItem.Tool -> it.copy(startMs = if (!anchored) turnStart else 0).also { anchored = true }
+                    else -> it
+                }
+            }
+            r.o("inflight")?.let { inf ->
+                val partial = inf.s("assistant")
+                if (partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = true, startMs = turnStart)
+                inf.sn("status")?.let { status.value = it }
+            }
         }
         items.value = list
         userSeen = ord
-        if (running) { busy.value = true; if (turnStart == 0L) turnStart = now() }
+        if (running) busy.value = true
         // questions that were waiting for us while we were away
         val waiting = mutableListOf<ServerAsk>()
         r.a("open_requests").objs().forEach { q -> q["id"]?.let { waiting += ServerAsk(it, q.s("method"), q.o("params") ?: JsonObject(emptyMap())) } }
@@ -418,6 +484,22 @@ class Gateway(private val api: Api, private val store: Store) {
             if (waiting.none { it.method == "approval" }) waiting += ServerAsk(JsonPrimitive("resume-approval:$rid"), "approval", pa)
         }
         if (waiting.isNotEmpty()) asks.update { l -> l + waiting.filter { w -> l.none { it.id == w.id } } }
+    }
+
+    /** A transcript timestamp (epoch seconds/ms or ISO) to millis; 0 when absent. */
+    private fun histTime(v: JsonElement?): Long {
+        val c = (v as? JsonPrimitive)?.contentOrNull ?: return 0
+        c.toDoubleOrNull()?.let { return if (it < 1e12) (it * 1000).toLong() else it.toLong() }
+        return runCatching { java.time.OffsetDateTime.parse(c).toInstant().toEpochMilli() }
+            .recoverCatching { java.time.LocalDateTime.parse(c).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }.getOrDefault(0)
+    }
+
+    /** Server epoch (seconds or ms) to phone millis; null when missing or not believable. */
+    private fun serverTime(v: JsonElement?): Long? {
+        val d = (v as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: return null
+        val ms = if (d < 1e12) (d * 1000).toLong() else d.toLong()
+        val n = now()
+        return ms.takeIf { it in (n - 24 * 3600_000L)..(n + 60_000L) }?.coerceAtMost(n)
     }
 
     private fun stampUserRow(row: Long) = items.update { l ->
@@ -435,6 +517,7 @@ class Gateway(private val api: Api, private val store: Store) {
         pl.sn("model")?.let { if (it.isNotBlank()) model.value = it }
         pl["yolo"]?.let { yolo.value = pl.b("yolo") }
         fastFromInfo(pl)?.let { fast.value = it }
+        if (pl.b("running") && busy.value) serverTime(pl["turn_started_at"])?.let { if (turnStart == 0L || it < turnStart) turnStart = it }
         pl.sn("reasoning_effort")?.let { if (it.isNotBlank()) reasoning.value = it }
         // the agent is built now: carry your saved speed into this chat once (settings sent before the build are dropped)
         val built = pl.sn("model").orEmpty().isNotBlank() && !pl.b("lazy")

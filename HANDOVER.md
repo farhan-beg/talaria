@@ -2,7 +2,7 @@
 
 Talaria (`dev.hark.hermes`) is a native Android client for Hermes Agent, written in Kotlin with Jetpack Compose. It talks to the Hermes dashboard over REST (`/api/...`) and the same WebSocket JSON-RPC gateway the desktop app uses (`/api/ws`).
 
-Current version: **1.14.0**, versionCode **17**. It is built and signed but has **not been tested on a device**.
+Current version: **1.14.1**, versionCode **18**. It is built and signed but has **not been tested on a device**.
 
 ## Layout
 - `data/Api.kt`: REST client, base URL, token refresh.

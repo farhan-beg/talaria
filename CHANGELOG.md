@@ -3,6 +3,16 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.1] - 2026-10-07
+
+### Chat stability
+- After a reconnect or relaunch, the message that started a still-running turn reappears. It isn't saved on the server until the turn ends, so the app now restores it from the server's in-flight copy, or from what this phone sent.
+- The running timer counts from when the server started the turn (`turn_started_at`), not from when the app reconnected or relaunched.
+- Short lines like "Let me check." no longer pick up timing saved from an older turn.
+- Finished turns loaded from history show "Worked for …", worked out from the server's message timestamps, instead of a step count.
+- A close arriving late from an old connection can no longer kill the new one. Each socket gets a generation number, and callbacks from older sockets are ignored.
+- A watchdog pings the server when a running turn goes quiet for 40 seconds and reconnects if the link is dead.
+
 ## [1.14.0] - 2026-10-07
 
 Rolls up 1.12.0, 1.13.0 and 1.14.0.

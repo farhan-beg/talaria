@@ -4,10 +4,11 @@ package dev.hark.hermes.data
 sealed interface Seg {
     val key: String
     data class Item(val item: ChatItem, val stats: TurnStats? = null) : Seg { override val key get() = item.key }
-    data class Work(override val key: String, val steps: List<ChatItem>, val live: Boolean) : Seg {
+    data class Work(override val key: String, val steps: List<ChatItem>, val live: Boolean, val tailMs: Long = 0) : Seg {
         val toolCount get() = steps.count { it is ChatItem.Tool }
         val startMs get() = steps.minOfOrNull { when (it) { is ChatItem.Tool -> it.startMs; is ChatItem.Assistant -> it.startMs; else -> 0L }.takeIf { t -> t > 0 } ?: Long.MAX_VALUE }?.takeIf { it != Long.MAX_VALUE } ?: 0L
-        val endMs get() = steps.maxOfOrNull { when (it) { is ChatItem.Tool -> maxOf(it.endMs, it.startMs); is ChatItem.Assistant -> maxOf(it.endMs, it.firstMs); else -> 0L } } ?: 0L
+        // through the end of the answer, so "Worked for" covers the whole turn
+        val endMs get() = maxOf(tailMs, steps.maxOfOrNull { when (it) { is ChatItem.Tool -> maxOf(it.endMs, it.startMs); is ChatItem.Assistant -> maxOf(it.endMs, it.firstMs); else -> 0L } } ?: 0L)
     }
 }
 
@@ -30,13 +31,15 @@ fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
             .takeIf { idx -> idx >= 0 && turn.drop(idx + 1).none { it is ChatItem.Tool } } ?: -1
         val steps = mutableListOf<ChatItem>()
         var placed = false
+        var tail = 0L
         val rows = mutableListOf<Seg>()
         turn.forEachIndexed { n, it ->
             when {
                 n == ansIdx -> {
                     val a = it as ChatItem.Assistant
                     if (a.reasoning.isNotBlank()) steps += a.copy(key = a.key + "-r", text = "")
-                    if (!placed && steps.isNotEmpty()) { rows += Seg.Work("w-" + steps.first().key, steps.toList(), live); placed = true }
+                    tail = maxOf(a.endMs, a.firstMs)
+                    if (!placed && steps.isNotEmpty()) { rows += Seg.Work("w-" + steps.first().key, steps.toList(), live, tail); placed = true }
                     rows += Seg.Item(a.copy(reasoning = ""), TurnStats.of(turn.filterIsInstance<ChatItem.Assistant>()))
                 }
                 it is ChatItem.Tool || it is ChatItem.Assistant -> {
@@ -51,7 +54,7 @@ fun foldTurns(items: List<ChatItem>, busy: Boolean): List<Seg> {
         } else if (placed) {
             // keep the block's steps in sync if more arrived after the answer (rare)
             val wi = rows.indexOfFirst { it is Seg.Work }
-            if (wi >= 0) rows[wi] = Seg.Work((rows[wi] as Seg.Work).key, steps.toList(), live)
+            if (wi >= 0) rows[wi] = Seg.Work((rows[wi] as Seg.Work).key, steps.toList(), live, tail)
         }
         out += rows
         i = j

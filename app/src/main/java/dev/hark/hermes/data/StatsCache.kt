@@ -25,7 +25,10 @@ object StatsCache {
     }
 
     fun restore(a: ChatItem.Assistant): ChatItem.Assistant = runCatching {
+        // short lines repeat across turns ("Let me check."), so their timings can't be trusted
+        if (a.text.trim().length < 48) return a
         val v = prefs.getString(id(a.text), null)?.split(',') ?: return a
+        if (v[2].toLong() - v[0].toLong() !in 0..6 * 3600_000L) return a
         a.copy(startMs = v[0].toLong(), firstMs = v[1].toLong(), endMs = v[2].toLong(), outTokens = v[3].toLong(), chars = v[4].toInt().coerceAtLeast(a.text.length))
     }.getOrDefault(a)
 }
