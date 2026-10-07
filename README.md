@@ -15,6 +15,10 @@ Version 1.14.9 (versionCode 26). Not affiliated with Nous Research.
     <td><img src="docs/screenshots/home.jpg" width="270" alt="Home dashboard"></td>
     <td><img src="docs/screenshots/sessions.jpg" width="270" alt="Sessions"></td>
   </tr>
+  <tr>
+    <td><img src="docs/screenshots/automations.jpg" width="270" alt="Automations"></td>
+    <td><img src="docs/screenshots/newchat.jpg" width="270" alt="New chat"></td>
+  </tr>
 </table>
 
 ## Install
