@@ -43,7 +43,8 @@ fun SessionsScreen(nav: NavHostController) {
     val bg by app.store.showBackground.collectAsState()
     // the Automation/Subagents chips are an explicit ask, so they fetch everything
     val wantAll = bg || filter == "automation" || filter == "subagents" || filter == "all"
-    val data = rememberLoad(profile, limit, debounced, wantAll) {
+    val hideCli by app.store.hideCli.collectAsState()
+    val data = rememberLoad(profile, limit, debounced, wantAll, hideCli) {
         if (debounced.isNotBlank()) app.api.obj("/api/sessions/search?q=${Api.enc(debounced)}").a("results").objs()
         else app.api.obj(sessionsUrl(limit, wantAll)).a("sessions").objs()
     }

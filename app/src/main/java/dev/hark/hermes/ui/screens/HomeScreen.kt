@@ -33,7 +33,8 @@ fun HomeScreen(nav: NavHostController) {
     val profile = profile0 + "@" + server
     val status = rememberLoad(profile, poll = 8000) { app.api.obj("/api/status", profile = false) }
     val bgSessions by app.store.showBackground.collectAsState()
-    val sessions = rememberLoad(profile, bgSessions) { app.api.obj(sessionsUrl(24, bgSessions)) }
+    val hideCli by app.store.hideCli.collectAsState()
+    val sessions = rememberLoad(profile, bgSessions, hideCli) { app.api.obj(sessionsUrl(24, bgSessions)) }
     val visible = rememberSessionFilter()
     val model = rememberLoad(profile) { runCatching { app.api.obj("/api/model/info") }.getOrNull() }
     val sys = rememberLoad(server, poll = 15000) { runCatching { app.api.obj("/api/system/stats", profile = false) }.getOrNull() }
@@ -153,32 +154,50 @@ fun HomeScreen(nav: NavHostController) {
 }
 
 private val SUBAGENT_SOURCES = setOf("subagent", "kanban", "delegate", "delegation", "worker")
-private val AUTOMATION_SOURCES = setOf("cron", "tool", "api", "acp", "oneshot", "recovered")
+// api_server is Hermes' OpenAI-compatible endpoint: other programs (or Hermes calling itself), never this app
+private val AUTOMATION_SOURCES = setOf("cron", "tool", "api", "api_server", "acp", "oneshot", "recovered")
+/** Terminal sessions; Hermes also starts these itself with `hermes chat -q`, so they're hidden unless you opt in. */
+private val CLI_SOURCES = setOf("cli")
+
+/**
+ * Where a session really came from. Hermes keeps `source` as live routing state, so opening a cron run or a
+ * helper's session from a chat client flips it (to "tui", "desktop", ...); `created_source` is stamped once
+ * at creation and never changes, so it decides.
+ */
+private fun JsonObject.origins(): Set<String> = setOfNotNull(sn("created_source")?.lowercase(), sn("source")?.lowercase()).filter { it.isNotBlank() }.toSet()
+private val CRON_RUN_ID = Regex("^cron_.+_\\d{8}_\\d{6}$")
 
 /** Sessions spawned by delegate_task / kanban workers rather than by you. */
 fun JsonObject.isSubagent(): Boolean {
-    val src = s("source").lowercase()
     val id = sn("session_id") ?: s("id")
-    return src in SUBAGENT_SOURCES || id.startsWith("delegate_") || id.startsWith("subagent_") || id.startsWith("kanban_") ||
-        sn("_delegate_from") != null || sn("delegate_from") != null
+    return origins().any { it in SUBAGENT_SOURCES } || id.startsWith("delegate_") || id.startsWith("subagent_") || id.startsWith("kanban_") ||
+        sn("_delegate_from") != null || sn("delegate_from") != null || (o("model_config")?.sn("_delegate_from") != null)
 }
-fun JsonObject.isAutomation() = s("source").lowercase() in AUTOMATION_SOURCES || (sn("session_id") ?: s("id")).startsWith("cron_")
+fun JsonObject.isAutomation(): Boolean {
+    val id = sn("session_id") ?: s("id")
+    val o = origins()
+    return o.any { it in AUTOMATION_SOURCES } || (app.store.hideCli.value && o.any { it in CLI_SOURCES }) || id.startsWith("cron_") || CRON_RUN_ID.matches(id)
+}
 
 /**
  * Session list URL. Unless you opted in, the server drops background runs itself. The exclusion list
  * deliberately leaves out "subagent": per Hermes' subagent_listing_scope, naming other sources without it
  * keeps delegate children hidden even when the server has sessions.show_subagents turned on.
  */
-private val HIDDEN_SOURCES = listOf("acp", "cron", "kanban", "oneshot", "tool", "recovered")
+private val HIDDEN_SOURCES = listOf("acp", "api_server", "cron", "kanban", "oneshot", "tool", "recovered")
+private fun hiddenSources() = HIDDEN_SOURCES + if (app.store.hideCli.value) CLI_SOURCES else emptySet()
 fun sessionsUrl(limit: Int, background: Boolean = app.store.showBackground.value): String =
-    "/api/sessions?limit=$limit&offset=0&order=recent" + if (background) "" else "&exclude_sources=" + HIDDEN_SOURCES.joinToString(",")
+    // rows whose live source flipped slip past the server's filter and are dropped on the phone, so ask for extra
+    if (background) "/api/sessions?limit=$limit&offset=0&order=recent"
+    else "/api/sessions?limit=${(limit * 2).coerceAtMost(100)}&offset=0&order=recent&exclude_sources=" + hiddenSources().joinToString(",")
 
 /** The user's session-visibility settings, as a predicate. */
 @Composable
 fun rememberSessionFilter(): (JsonObject) -> Boolean {
     val bg by app.store.showBackground.collectAsState()
     val empty by app.store.hideEmpty.collectAsState()
-    return remember(bg, empty) {
+    val cli by app.store.hideCli.collectAsState()
+    return remember(bg, empty, cli) {
         { s -> (bg || (!s.isSubagent() && !s.isAutomation())) && !(empty && s.l("message_count") == 0L && !s.b("is_active")) }
     }
 }

@@ -163,6 +163,8 @@ class Store(context: Context) {
     val hideEmpty = flag("hide_empty", true)
     /** Off by default: recents show only your own chats, not subagent or cron runs. */
     val showBackground = flag("show_background_sessions", false)
+    /** On by default: `hermes chat -q` runs Hermes starts itself (source cli) count as background work. */
+    val hideCli = flag("hide_cli_sessions", true)
     val nerd = flag("nerd_stats", false)
     /** Your fast-mode choice, re-applied to each chat (the server scopes it per session). */
     val fastPref = flag("fast_pref", false)

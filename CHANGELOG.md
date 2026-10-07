@@ -3,6 +3,22 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.3] - 2026-10-07 (versionCode 20)
+
+### Fixed
+- Sessions Hermes starts on its own (through `hermes chat -q` with source `cli`, or through its OpenAI-compatible API with source `api_server`) no longer show up as your chats.
+  - `api_server` sessions always count as background/automation.
+  - New setting, Settings → Sessions → "Treat CLI sessions as background" (on by default). Turn it off if you chat with Hermes from the terminal.
+  - Both are excluded on the server (`exclude_sources`) and filtered on the phone, and the lists refetch when the setting changes.
+
+## [1.14.2] - 2026-10-07 (versionCode 19)
+
+### Fixed
+- Subagent and cron sessions stay hidden when "Show subagent & cron sessions" is off, even after you've opened one.
+  - Hermes keeps `source` as live routing state, so opening a cron run or delegate session from a client flips it (e.g. to `tui`/`desktop`). That let it slip past both the server's `exclude_sources` and the app's own filter.
+  - Sessions are now classified by the immutable `created_source` (falling back to `source`), the `cron_<job>_<YYYYmmdd_HHMMSS>` run-id pattern, and `_delegate_from` markers.
+  - With the toggle off the app requests twice the page size, so rows dropped on the phone don't leave recents short.
+
 ## [1.14.1] - 2026-10-07
 
 ### Chat stability

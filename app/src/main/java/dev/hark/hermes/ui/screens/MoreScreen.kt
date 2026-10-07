@@ -135,8 +135,10 @@ fun SettingsScreen(nav: NavHostController) {
         item {
             val bg by app.store.showBackground.collectAsState()
             val empty by app.store.hideEmpty.collectAsState()
+            val cli by app.store.hideCli.collectAsState()
             HCard(padding = 8.dp) {
-                SettingToggle("Show subagent & cron sessions", "Off keeps recents to your own chats", Icons.Outlined.AccountTree, bg) { app.store.set(app.store.showBackground, "show_background_sessions", it) }
+                SettingToggle("Show subagent & cron sessions", "Off keeps recents to your own chats. API sessions are always background.", Icons.Outlined.AccountTree, bg) { app.store.set(app.store.showBackground, "show_background_sessions", it) }
+                SettingToggle("Treat CLI sessions as background", "Hermes starts these itself with hermes chat -q. Turn off if you chat from the terminal.", Icons.Outlined.Terminal, cli) { app.store.set(app.store.hideCli, "hide_cli_sessions", it) }
                 SettingToggle("Hide empty sessions", "Sessions with no messages", Icons.Outlined.HideSource, empty) { app.store.set(app.store.hideEmpty, "hide_empty", it) }
             }
         }
