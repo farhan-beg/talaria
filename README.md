@@ -4,14 +4,20 @@ An independent Android client for Hermes Agent servers.
 
 Version 1.14.9 (versionCode 26). Not affiliated with Nous Research.
 
+## Install
+
+Download the signed APK from the [latest release](https://github.com/farhan-beg/talaria/releases/latest). Runs on Android 8.0 or newer.
+
 ## Features
 
 - Chat with streaming replies, reasoning traces, and tool-call rendering
-- Session history, resume, and live reconnect over the Hermes gateway WebSocket
+- Markdown composer with a formatting bar, live styling while you type, preview, and fully rendered messages
+- Voice mode: dictate your turns, and have replies read in your phone's voice or through your server's TTS provider
+- Session history with filters, mid-turn resume, and live reconnect over the Hermes gateway WebSocket
+- Attachments, reactions, and a file browser
 - Automations (scheduled prompts), webhooks, profiles, and channel management
-- Admin panels: models, skills, keys, MCP servers, memory, logs, system
+- Admin panels: models, skills, keys, MCP servers, memory, logs, system, and analytics
 - Sign-in with dashboard credentials and native token refresh; encrypted local storage
-- Voice input and text-to-speech playback
 - Customizable look: palettes, glass effects, motion, and ambient background
 
 ## Build
@@ -24,4 +30,4 @@ The release build is unsigned unless a `keystore.properties` file is present.
 
 ## Status
 
-Early snapshot; features and structure are still changing.
+Actively developed; releases are signed and built on CI. Installs via the Releases page, not Google Play.
