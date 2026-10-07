@@ -206,10 +206,12 @@ fun rememberSessionFilter(): (JsonObject) -> Boolean {
 fun SessionRow(s: JsonObject, onClick: () -> Unit) {
     val p = LocalPalette.current
     val title = s.sn("title") ?: s.sn("preview") ?: "Untitled"
+    val mineIds by app.store.mineSessions.collectAsState()
+    val mine = listOfNotNull(s.sn("id"), s.sn("session_id"), s.sn("_lineage_root_id")).any { it in mineIds }
     ListRow(
         title = title,
-        subtitle = listOfNotNull(s.sn("source"), s.sn("model"), "${s.l("message_count")} msgs", relTime(s.d("last_active"))).joinToString(" · "),
-        icon = sourceIcon(s.s("source")),
+        subtitle = listOfNotNull(if (mine) "Talaria" else s.sn("source"), s.sn("model"), "${s.l("message_count")} msgs", relTime(s.d("last_active"))).joinToString(" · "),
+        icon = if (mine) Icons.Outlined.PhoneAndroid else sourceIcon(s.s("source")),
         trailing = { if (s.b("is_active")) Dot(p.good, pulse = true) },
         onClick = onClick,
     )

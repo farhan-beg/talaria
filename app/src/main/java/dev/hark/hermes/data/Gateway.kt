@@ -85,7 +85,9 @@ class Gateway(private val api: Api, private val store: Store) {
     val attachments = MutableStateFlow<List<Attachment>>(emptyList())
 
     @Volatile var runtimeSid: String = ""; private set
-    @Volatile var storedSid: String = ""; private set
+    /** A chat started on this phone keeps its Talaria label when compression moves it onto a new id. */
+    @Volatile var storedSid: String = ""
+        private set(v) { if (v.isNotBlank() && v != field && field.isNotBlank() && store.isMine(field)) store.markMine(v); field = v }
     private var seq = 0L
     private var userSeen = 0
     private fun k(p: String) = "$p-${seq++}"
@@ -625,6 +627,7 @@ class Gateway(private val api: Api, private val store: Store) {
             val r = try { rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null }, "fast" to (if (store.fastPref.value) true else null))) }
                 catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", jsonOf("cols" to 80, "profile" to p.ifBlank { null })) }
             storedSid = r.s("stored_session_id")
+            store.markMine(storedSid)
             applySnapshot(r)
             runCatching { loadRunSettings() }
         } finally { loadingSession.value = false }

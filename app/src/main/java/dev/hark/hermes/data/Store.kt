@@ -168,6 +168,14 @@ class Store(context: Context) {
     val nerd = flag("nerd_stats", false)
     /** Your fast-mode choice, re-applied to each chat (the server scopes it per session). */
     val fastPref = flag("fast_pref", false)
+    /** Sessions started on this phone. Hermes stamps them "tui" (the protocol we speak), so the label lives here. */
+    val mineSessions = MutableStateFlow(prefs.getStringSet("mine_sessions", emptySet())!!.toSet())
+    fun isMine(id: String) = id.isNotBlank() && id in mineSessions.value
+    fun markMine(id: String) {
+        if (id.isBlank() || id in mineSessions.value) return
+        val next = (mineSessions.value + id).let { if (it.size > 3000) it.drop(it.size - 3000).toSet() else it }
+        prefs.edit().putStringSet("mine_sessions", next).apply(); mineSessions.value = next
+    }
     var askedNotif: Boolean
         get() = prefs.getBoolean("asked_notif", false)
         set(v) { prefs.edit().putBoolean("asked_notif", v).apply() }

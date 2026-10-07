@@ -491,18 +491,41 @@ fun ChatScreen(nav: NavHostController) {
     }
 }
 
+private val HEADLINES_ANY = listOf(
+    "Where should Hermes fly next?", "What's on your mind?", "What are we building today?", "Give me something to chew on.",
+    "Hand me the hard part.", "What needs untangling?", "Point me at a problem.", "What should we ship?",
+    "Got a loose end to tie up?", "What's worth figuring out?", "Ask me anything. Then ask harder.", "Wings are warmed up.",
+    "Which rabbit hole today?", "What's the next small win?", "Let's make something work.", "What's bugging you?",
+)
+private val HEADLINES_MORNING = listOf("What's first on the list?", "Let's set the day up right.", "Coffee's on you. The rest is on me.", "Fresh start. What's the plan?")
+private val HEADLINES_AFTERNOON = listOf("What's left on the board?", "Need a second pair of hands?", "Let's clear the backlog.", "Halfway there. What's next?")
+private val HEADLINES_EVENING = listOf("Wrapping up or just getting going?", "One more thing before you log off?", "Let's close a few tabs.", "What can I take off your plate?")
+private val HEADLINES_NIGHT = listOf("Can't sleep? Let's build.", "The servers are quiet. What's up?", "Night shift, reporting in.", "Midnight ideas welcome.")
+
+/** A different line each time: time-of-day lines mixed in, never the same one twice in a row. */
+private fun pickHeadline(hour: Int): String {
+    val timed = when (hour) { in 5..11 -> HEADLINES_MORNING; in 12..16 -> HEADLINES_AFTERNOON; in 17..21 -> HEADLINES_EVENING; else -> HEADLINES_NIGHT }
+    val pool = HEADLINES_ANY + timed
+    val prefs = app.getSharedPreferences("talaria_ui", android.content.Context.MODE_PRIVATE)
+    val last = prefs.getString("last_headline", null)
+    val pick = pool.filter { it != last }.random()
+    prefs.edit().putString("last_headline", pick).apply()
+    return pick
+}
+
 @Composable
 private fun EmptyChat(pick: (String) -> Unit) {
     val p = LocalPalette.current
     val hour = remember { java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY) }
     val greet = when (hour) { in 5..11 -> "Good morning"; in 12..16 -> "Good afternoon"; in 17..21 -> "Good evening"; else -> "Up late?" }
+    val headline = remember { pickHeadline(hour) }
     val ideas = listOf("Summarize what you did today", "Check my server's disk and memory", "Draft a cron job that sends me news at 9am")
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.Bottom,
     ) {
         Text(greet, style = MaterialTheme.typography.displaySmall, color = p.ink, modifier = Modifier.padding(horizontal = 6.dp))
-        Text("Where should Hermes fly next?", style = MaterialTheme.typography.displaySmall, color = p.faint, modifier = Modifier.padding(horizontal = 6.dp))
+        Text(headline, style = MaterialTheme.typography.displaySmall, color = p.faint, modifier = Modifier.padding(horizontal = 6.dp))
         Spacer(Modifier.height(24.dp))
         ideas.forEach { text ->
             Text(text, color = p.ink, style = MaterialTheme.typography.bodyLarge,

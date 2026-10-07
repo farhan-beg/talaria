@@ -3,6 +3,18 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.5] - 2026-10-07 (versionCode 22)
+
+### Added
+- Chats started from Talaria are labeled "Talaria" with a phone icon in Home recents, History and the Conversations sheet, instead of "tui".
+  - Hermes stamps every /api/ws session with source `tui`, the protocol the app speaks, and the app deliberately does not send a custom source: Hermes derives the agent platform from it, so a "mobile" source would change the toolsets and prompt.
+  - The app remembers the session ids it creates (and follows compression rotations), so the label is local to the phone. Chats from before this version and other devices still show their Hermes source.
+
+## [1.14.4] - 2026-10-07 (versionCode 21)
+
+### Changed
+- The line under the greeting on a new chat changes every time. It picks from a mix of general lines and lines for the time of day (morning, afternoon, evening, late night) and never repeats the previous one. The greeting still follows the phone clock.
+
 ## [1.14.3] - 2026-10-07 (versionCode 20)
 
 ### Fixed
