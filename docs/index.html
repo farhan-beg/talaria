@@ -138,16 +138,6 @@ section{padding:56px 0}
 .theme b{display:block; font-size:13px; font-weight:600}
 .theme span{font-size:11.5px; color:var(--faint)}
 
-/* steps */
-.steps{display:grid; grid-template-columns:repeat(3,1fr); gap:16px; counter-reset:step}
-.step{background:rgba(28,22,48,.6); border:1px solid var(--line); border-radius:22px; padding:24px}
-.step-num{width:34px; height:34px; border-radius:50%; background:var(--gold-soft); border:1px solid rgba(240,196,108,.35);
-  color:var(--gold); display:flex; align-items:center; justify-content:center; font-weight:600; font-size:15px; margin-bottom:14px}
-.step h3{font-size:15.5px; font-weight:600; margin-bottom:6px}
-.step p{color:var(--muted); font-size:13.8px}
-.step code{font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:12.5px; background:var(--code); border:1px solid var(--line);
-  padding:2px 7px; border-radius:7px; color:#E8DFC9}
-
 /* install */
 .install{background:linear-gradient(140deg, rgba(42,34,66,.75), rgba(23,17,42,.85)); border:1px solid var(--line-strong); border-radius:var(--r); padding:38px; display:grid; grid-template-columns:1.25fr .75fr; gap:30px; align-items:center}
 .install h2{font-family:var(--serif); font-weight:500; font-size:clamp(24px,2.8vw,32px); letter-spacing:-.015em}
@@ -158,15 +148,6 @@ section{padding:56px 0}
 .spec:last-child{border-bottom:none}
 .spec span{color:var(--faint)}
 .spec b{font-weight:600; color:var(--ink)}
-
-/* faq */
-details{border:1px solid var(--line); border-radius:18px; background:rgba(28,22,48,.5); padding:18px 22px; margin-bottom:10px}
-details[open]{border-color:rgba(240,196,108,.3)}
-summary{cursor:pointer; font-weight:600; font-size:15px; list-style:none; display:flex; justify-content:space-between; align-items:center; gap:16px}
-summary::-webkit-details-marker{display:none}
-summary::after{content:"+"; color:var(--gold); font-weight:500; font-size:19px; transition:transform .2s ease}
-details[open] summary::after{transform:rotate(45deg)}
-details p{color:var(--muted); font-size:14px; margin-top:12px; max-width:70ch}
 
 /* footer */
 footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
@@ -190,7 +171,6 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
   .hero-grid{grid-template-columns:1fr; gap:40px}
   .grid3{grid-template-columns:repeat(2,1fr)}
   .theme-row{grid-template-columns:repeat(3,1fr)}
-  .steps{grid-template-columns:1fr}
   .install{grid-template-columns:1fr; padding:28px}
   .install-side{border-left:none; padding-left:0; border-top:1px solid var(--line); padding-top:22px}
 }
@@ -214,7 +194,7 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
       <a href="#screens">Screens</a>
       <a href="#features">Features</a>
       <a href="#themes">Themes</a>
-      <a href="#install">Install</a>
+      <a href="#install">Download</a>
     </div>
     <div class="nav-cta">
       <a class="btn btn-ghost" href="https://github.com/farhan-beg/talaria">GitHub</a>
@@ -338,75 +318,25 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
   </div>
 </section>
 
-<section id="how">
-  <div class="wrap">
-    <div class="sec-head rv">
-      <h2>Running in two minutes.</h2>
-      <p>Talaria is a client. It expects a Hermes Agent you already run, on your own box, on your network.</p>
-    </div>
-    <div class="steps">
-      <div class="step rv">
-        <div class="step-num">1</div>
-        <h3>Run Hermes Agent</h3>
-        <p>One command on your server: <code>curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash</code>. Keep the dashboard reachable over https, your LAN or a VPN.</p>
-      </div>
-      <div class="step rv">
-        <div class="step-num">2</div>
-        <h3>Install Talaria</h3>
-        <p>A single signed APK from GitHub releases. No Play listing, no account, no ads. New versions install right over the old one.</p>
-      </div>
-      <div class="step rv">
-        <div class="step-num">3</div>
-        <h3>Point it at your server</h3>
-        <p>Enter your dashboard address, sign in with the credentials you already use, and your agent is on your phone.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
 <section id="install">
   <div class="wrap">
     <div class="install rv">
       <div>
-        <h2>Get Talaria 1.14.12</h2>
-        <p>Fixes for the first eleven community-tracked issues, from approval handshakes to live subagents and per-server connections. Signed with the same key as every release, so updates apply cleanly.</p>
+        <h2>Get Talaria</h2>
+        <p>Everything lives on GitHub: the source, the changelog, and the signed APK. Grab the latest release, or browse every version back to the first.</p>
         <div class="cta-row">
           <a class="btn btn-gold" href="https://github.com/farhan-beg/talaria/releases/latest">Download the APK</a>
-          <a class="btn btn-ghost" href="https://github.com/farhan-beg/talaria/releases">All releases</a>
+          <a class="btn btn-ghost" href="https://github.com/farhan-beg/talaria">Browse the repo</a>
         </div>
       </div>
       <div class="install-side">
-        <div class="spec"><span>Version</span><b>1.14.12</b></div>
+        <div class="spec"><span>Latest</span><b>v1.14.12</b></div>
         <div class="spec"><span>Requires</span><b>Android 8.0+</b></div>
         <div class="spec"><span>Size</span><b>2.4 MB</b></div>
         <div class="spec"><span>License</span><b>MIT</b></div>
-        <div class="spec"><span>Signing</span><b>Same key across releases</b></div>
+        <div class="spec"><span>Source</span><b>github.com/farhan-beg/talaria</b></div>
       </div>
     </div>
-  </div>
-</section>
-
-<section id="faq">
-  <div class="wrap" style="max-width:820px">
-    <div class="sec-head rv">
-      <h2>Fair questions.</h2>
-    </div>
-    <details class="rv" open>
-      <summary>Is this an official Nous Research app?</summary>
-      <p>No. Talaria is an independent, community-built client. Hermes Agent itself is built by Nous Research under the MIT license, and this project is not affiliated with them. It just speaks the same gateway your dashboard does.</p>
-    </details>
-    <details class="rv">
-      <summary>Where does my data go?</summary>
-      <p>To your server, and nowhere else. Sign-in uses your own dashboard credentials, tokens are stored encrypted on the device, and the app has no analytics, crash reporting or telemetry of any kind.</p>
-    </details>
-    <details class="rv">
-      <summary>Why is it not on the Play Store?</summary>
-      <p>Sideloading keeps the release honest and instant: every version that gets built is the version you can download, signed on the same key since the first public release. Grab the APK, tap install, done.</p>
-    </details>
-    <details class="rv">
-      <summary>Can I run more than one server?</summary>
-      <p>Yes. Save as many as you like. Each keeps its own live connection, so a reply on server A keeps streaming while you chat on server B, and notifications bring you back to the right chat.</p>
-    </details>
   </div>
 </section>
 
@@ -453,7 +383,7 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
     });
   }, 1500);
   // stagger cards slightly for a calmer entrance
-  document.querySelectorAll('.grid3 .card, .theme-row .theme, .steps .step').forEach(function(e,i){
+  document.querySelectorAll('.grid3 .card, .theme-row .theme').forEach(function(e,i){
     e.style.transitionDelay = (i % 6) * 45 + 'ms';
   });
 })();
