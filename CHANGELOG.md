@@ -3,6 +3,12 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.13] - 2026-10-08 (versionCode 30)
+
+- Links in chat open with a single tap: text selection and the bubble's long-press used to swallow the tap. Web links open in your browser or the app that handles them; file paths open in the viewer. Long-press still selects text and opens the menu.
+- Bare `www.` links are now tappable too.
+- Same fix for links in headings, list items and tables.
+
 ## [1.14.12] - 2026-10-08 (versionCode 29)
 
 Fixes for the 11 tracked issues (#1-#11):

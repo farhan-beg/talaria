@@ -1,6 +1,10 @@
 package dev.hark.hermes.ui
 
 import androidx.compose.animation.*
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.pointerInput
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -421,6 +425,59 @@ fun CodeBlock(text: String, maxHeight: Dp = 420.dp, lang: String = "", header: B
     }
 }
 
+
+/** Opens a web link in the phone's browser (or the app that owns it), or a Hermes file path in the viewer. */
+fun openLink(ctx: android.content.Context, target: String) {
+    val t = target.trim()
+    if (t.startsWith("http://") || t.startsWith("https://") || t.startsWith("mailto:") || t.startsWith("tel:") || t.startsWith("www.")) {
+        val uri = android.net.Uri.parse(if (t.startsWith("www.")) "https://$t" else t)
+        val i = android.content.Intent(android.content.Intent.ACTION_VIEW, uri).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        try { ctx.startActivity(i) } catch (_: Exception) {
+            try { ctx.startActivity(android.content.Intent.createChooser(i, "Open with").addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            catch (_: Exception) { android.widget.Toast.makeText(ctx, "No app can open this link", android.widget.Toast.LENGTH_SHORT).show() }
+        }
+    } else dev.hark.hermes.ui.screens.FileOpen.open(t.removePrefix("file://"))
+}
+
+/**
+ * Text whose links open on a plain tap — also inside SelectionContainer and inside
+ * long-pressable bubbles, which used to swallow the tap. Long-press still selects / opens menus.
+ */
+@Composable
+fun LinkText(text: AnnotatedString, modifier: Modifier = Modifier, color: Color = Color.Unspecified, style: TextStyle = LocalTextStyle.current) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val hasLinks = remember(text) { text.getLinkAnnotations(0, text.length).isNotEmpty() }
+    val tapMod = if (!hasLinks) Modifier else Modifier.pointerInput(text) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+            val lay = layout ?: return@awaitEachGesture
+            val line = lay.getLineForVerticalPosition(down.position.y)
+            if (down.position.x < lay.getLineLeft(line) || down.position.x > lay.getLineRight(line)) return@awaitEachGesture
+            val off = lay.getOffsetForPosition(down.position)
+            val link = text.getLinkAnnotations(off, off + 1).firstOrNull()
+                ?: text.getLinkAnnotations((off - 1).coerceAtLeast(0), off).firstOrNull()
+                ?: return@awaitEachGesture
+            val up = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                var u: androidx.compose.ui.input.pointer.PointerInputChange? = null
+                while (u == null) {
+                    val ev = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                    val c = ev.changes.firstOrNull { it.id == down.id } ?: break
+                    if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) break
+                    if (!c.pressed) u = c
+                }
+                u
+            } ?: return@awaitEachGesture
+            up.consume()
+            when (val a = link.item) {
+                is LinkAnnotation.Url -> openLink(ctx, a.url)
+                is LinkAnnotation.Clickable -> openLink(ctx, a.tag)
+            }
+        }
+    }
+    Text(text, modifier.then(tapMod), color = color, style = style, onTextLayout = { layout = it })
+}
+
 // ── tiny markdown renderer ────────────────────────────────────────────────────
 @Composable
 fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Modifier = Modifier, body: TextStyle = MaterialTheme.typography.bodyLarge) {
@@ -431,19 +488,19 @@ fun Markdown(text: String, color: Color = LocalPalette.current.ink, modifier: Mo
             when (b) {
                 is Md.Code -> if (b.lang in COPY_LANGS) CopyCard(b.text.trimEnd(), b.lang) else CodeBlock(b.text.trimEnd(), 360.dp, b.lang, header = true)
                 is Md.Table -> MdTable(b, color)
-                is Md.Heading -> Text(inline(b.text, p), style = when (b.level) { 1 -> MaterialTheme.typography.titleLarge; 2 -> MaterialTheme.typography.titleMedium; else -> MaterialTheme.typography.titleSmall }, color = color)
+                is Md.Heading -> LinkText(inline(b.text, p), style = when (b.level) { 1 -> MaterialTheme.typography.titleLarge; 2 -> MaterialTheme.typography.titleMedium; else -> MaterialTheme.typography.titleSmall }, color = color)
                 is Md.Bullet -> Row(Modifier.padding(start = (b.indent * 14).dp), verticalAlignment = Alignment.Top) {
                     when (b.check) {
                         null -> Text(if (b.marker.isEmpty()) (if (b.indent % 2 == 0) "•" else "◦") else b.marker, color = p.muted, style = body, modifier = Modifier.width(if (b.marker.length > 2) 30.dp else 18.dp))
                         else -> Icon(if (b.check) Icons.Outlined.CheckBox else Icons.Outlined.CheckBoxOutlineBlank, null, tint = if (b.check) p.accent else p.muted, modifier = Modifier.padding(top = 3.dp, end = 6.dp).size(18.dp))
                     }
-                    Text(inline(b.text, p), color = if (b.check == true) p.muted else color, style = body.copy(textDecoration = if (b.check == true) androidx.compose.ui.text.style.TextDecoration.LineThrough else null))
+                    LinkText(inline(b.text, p), color = if (b.check == true) p.muted else color, style = body.copy(textDecoration = if (b.check == true) androidx.compose.ui.text.style.TextDecoration.LineThrough else null))
                 }
                 is Md.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
                     Box(Modifier.width(3.dp).fillMaxHeight().background(p.line)); Spacer(Modifier.width(10.dp))
                     Markdown(b.text, p.muted, body = body)
                 }
-                is Md.Para -> Text(inline(b.text, p), color = color, style = body)
+                is Md.Para -> LinkText(inline(b.text, p), color = color, style = body)
                 Md.Rule -> HorizontalDivider(color = p.line)
                 is Md.Img -> dev.hark.hermes.ui.screens.ChatImage(b.src)
                 is Md.FileRef -> dev.hark.hermes.ui.screens.FileChips(listOf(b.path))
@@ -524,7 +581,7 @@ private fun isFilePath(t: String) = (t.startsWith("/") || t.startsWith("~/")) &&
 private inline fun androidx.compose.ui.text.AnnotatedString.Builder.linked(target: String, p: Palette, mono: Boolean = false, body: androidx.compose.ui.text.AnnotatedString.Builder.() -> Unit) {
     val style = androidx.compose.ui.text.TextLinkStyles(SpanStyle(color = p.accent, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline, fontFamily = if (mono) Mono else null, background = if (mono) p.code else Color.Unspecified))
     val ann: androidx.compose.ui.text.LinkAnnotation = when {
-        target.startsWith("http://") || target.startsWith("https://") || target.startsWith("mailto:") -> androidx.compose.ui.text.LinkAnnotation.Url(target, style)
+        target.startsWith("http://") || target.startsWith("https://") || target.startsWith("mailto:") || target.startsWith("tel:") -> androidx.compose.ui.text.LinkAnnotation.Url(target, style)
         else -> androidx.compose.ui.text.LinkAnnotation.Clickable(target, style) { dev.hark.hermes.ui.screens.FileOpen.open(target.removePrefix("file://")) }
     }
     withLink(ann) { body() }
@@ -550,6 +607,11 @@ private fun inline(s: String, p: Palette): AnnotatedString = buildAnnotatedStrin
                 var e = i; while (e < s.length && !s[e].isWhitespace() && s[e] != ')' && s[e] != '>' && s[e] != '"') e++
                 while (e > i && s[e - 1] in ".,;:!?'") e--
                 val url = s.substring(i, e); linked(url, p) { append(url) }; i = e
+            }
+            s.startsWith("www.", i) && (i == 0 || s[i - 1].isWhitespace() || s[i - 1] == '(') && i + 5 < s.length && s.indexOf('.', i + 4).let { it in (i + 5) until s.length } -> {
+                var e = i; while (e < s.length && !s[e].isWhitespace() && s[e] != ')' && s[e] != '>' && s[e] != '"') e++
+                while (e > i && s[e - 1] in ".,;:!?'") e--
+                val url = s.substring(i, e); linked("https://$url", p) { append(url) }; i = e
             }
             s[i] == '/' && (i == 0 || s[i - 1].isWhitespace() || s[i - 1] == '(') && FILE_AT.matchAt(s, i) != null -> {
                 val m = FILE_AT.matchAt(s, i)!!; linked(m.value, p, mono = true) { append(m.value) }; i += m.value.length
@@ -631,7 +693,7 @@ private fun MdTable(t: Md.Table, color: Color) {
             Row(Modifier.background(p.code)) { (0 until cols).forEach { c -> Text(t.head.getOrElse(c) { "" }, color = color, style = MaterialTheme.typography.labelLarge, modifier = Modifier.widthIn(min = 90.dp, max = 220.dp).padding(10.dp)) } }
             t.rows.forEachIndexed { n, r ->
                 if (n > 0) HorizontalDivider(color = p.line)
-                Row { (0 until cols).forEach { c -> Text(inline(r.getOrElse(c) { "" }, p), color = color, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.widthIn(min = 90.dp, max = 220.dp).padding(10.dp)) } }
+                Row { (0 until cols).forEach { c -> LinkText(inline(r.getOrElse(c) { "" }, p), color = color, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.widthIn(min = 90.dp, max = 220.dp).padding(10.dp)) } }
             }
         }
     }
