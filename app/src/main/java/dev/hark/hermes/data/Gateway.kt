@@ -41,7 +41,9 @@ sealed interface ChatItem {
             return if (secs < 0.25) 0.0 else tokens / secs
         }
     }
-    data class Tool(override val key: String, val name: String, val preview: String, val done: Boolean, val summary: String = "", val duration: Double = 0.0, val startMs: Long = 0, val endMs: Long = 0) : ChatItem
+    data class Tool(override val key: String, val name: String, val preview: String, val done: Boolean, val summary: String = "", val duration: Double = 0.0, val startMs: Long = 0, val endMs: Long = 0,
+        /** Hermes flagged this tool's output (prompt injection, a leaked secret): the risk level and what it found. */
+        val risk: String = "", val findings: List<String> = emptyList()) : ChatItem
     /** `boundary`: Hermes started this turn itself (a background agent or process reported back), not you. */
     data class Notice(override val key: String, val text: String, val error: Boolean = false, val boundary: Boolean = false) : ChatItem
     /** Output of a slash command, shown as a terminal-style card. */
@@ -54,6 +56,19 @@ data class Attachment(val name: String, val kind: String, val path: String = "",
 data class SlashHint(val text: String, val display: String, val meta: String, val skill: Boolean, val usage: Long = 0)
 
 data class ServerAsk(val id: JsonElement, val method: String, val params: JsonObject)
+
+/** One delegated child, kept current from subagent.* events. */
+data class Subagent(val id: String, val goal: String, val status: String, val model: String = "", val depth: Int = 0,
+                    val toolCount: Int = 0, val lastTool: String = "", val summary: String = "", val startedAt: Long = 0, val endedAt: Long = 0,
+                    val inTok: Long = 0, val outTok: Long = 0) {
+    val done get() = status in setOf("completed", "failed", "error", "timeout", "interrupted")
+}
+
+/** A row of the agent's todo checklist (todo.updated). */
+data class Todo(val id: String, val text: String, val status: String)
+
+/** An out-of-band notice Hermes asked the client to show (notification.show). */
+data class HermesToast(val text: String, val level: String, val key: String?, val ttlMs: Long)
 
 enum class Conn { Idle, Connecting, Ready, Failed }
 
@@ -98,12 +113,20 @@ class RpcError(val code: Int, msg: String) : java.io.IOException(msg)
 /** Window-owned bridges only a Desktop window showing the chat can answer; everyone else declines with 4404. */
 private val WINDOW_ONLY_ASKS = setOf("preview.read", "preview.act", "terminal.read", "window.read", "tour", "display.install.sudo")
 /** Server requests this app can actually answer. */
-private val KNOWN_ASKS = setOf("approval", "clarify", "sudo", "secret", "vault.unlock_prompt", "vault.code")
+private val KNOWN_ASKS = setOf("approval", "clarify", "sudo", "secret", "vault.unlock_prompt", "vault.code", "vault.save_login")
 /** Reads that are safe to repeat after a dropped socket. */
 private val RETRYABLE = setOf("session.history", "config.get", "model.options", "commands.catalog", "complete.slash", "complete.path",
-    "subagent.list", "subagent.tail", "ping", "session.usage", "session.resume", "session.create")
+    "subagent.list", "subagent.tail", "ping", "session.usage", "session.resume", "session.create",
+    "session.context_breakdown", "session.control.read", "rollback.list", "rollback.diff", "delegation.status")
 
-class Gateway(private val api: Api, private val store: Store) {
+class Gateway(private val api: Api, private val store: Store, val serverId: String = "") {
+    /** The server the app is showing. Other servers keep their own live socket so their chats keep running. */
+    val isActive get() = serverId.isBlank() || serverId == store.activeId.value
+    /** The profile this connection talks to; frozen when you switch to another server. */
+    @Volatile private var frozenProfile = store.profile.value
+    private fun profileNow() = if (isActive) store.profile.value else frozenProfile
+    fun deactivate() { frozenProfile = store.profile.value }
+    fun activate() {}
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var ws: WebSocket? = null
     private val ids = AtomicLong(1)
@@ -142,7 +165,10 @@ class Gateway(private val api: Api, private val store: Store) {
         private set(v) {
             if (v.isNotBlank() && v != field && field.isNotBlank() && store.isMine(field)) store.markMine(v)
             field = v
-            if (v.isNotBlank()) runCatching { store.lastChat = v }
+            if (v.isNotBlank()) runCatching {
+                store.tagSession(v, serverId)
+                if (isActive) store.lastChat = v else store.setLastChat(serverId, frozenProfile, v)
+            }
         }
     private var seq = 0L
     private var userSeen = 0
@@ -193,8 +219,8 @@ class Gateway(private val api: Api, private val store: Store) {
         connError.value = null
         readyGate = CompletableDeferred()
         scope.launch {
-            val token = try { api.accessToken() } catch (e: Exception) { "" }
-            val req = Request.Builder().url(api.wsUrl("/api/ws", token)).build()
+            val token = try { api.accessTokenFor(serverId) } catch (e: Exception) { "" }
+            val req = Request.Builder().url(api.wsUrlFor(serverId, "/api/ws", token)).build()
             val gen = ++connGen
             if (!wanted) return@launch
             ws?.let { old -> ws = null; old.cancel() }   // its callbacks are now stale and ignored
@@ -232,7 +258,7 @@ class Gateway(private val api: Api, private val store: Store) {
                     val keep = storedSid
                     val r = resumeRpc(keep)
                     if (storedSid == keep) applySnapshot(r)
-                } else if (!wasReconnect && storedSid.isBlank() && items.value.isEmpty()) {
+                } else if (!wasReconnect && storedSid.isBlank() && items.value.isEmpty() && isActive) {
                     // cold start (process was killed while away): reopen the chat you were in, not a blank one
                     val last = store.lastChat
                     if (last.isNotBlank()) runCatching { resume(last, store.lastChatTitle.ifBlank { null }) }
@@ -316,7 +342,7 @@ class Gateway(private val api: Api, private val store: Store) {
         val id = "m${ids.getAndIncrement()}"
         val d = CompletableDeferred<JsonObject>()
         pending[id] = d
-        val prof = store.profile.value
+        val prof = profileNow()
         val sent = if (prof.isNotBlank() && method in PROFILE_AWARE && params["profile"] == null) JsonObject(params + ("profile" to JsonPrimitive(prof))) else params
         val frame = jsonOf("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to sent)
         if (ws?.send(frame.toString()) != true) { pending.remove(id); throw java.io.IOException("Not connected") }
@@ -373,6 +399,24 @@ class Gateway(private val api: Api, private val store: Store) {
                 }
             }
             "request.cancel" -> { val id = pl.s("id"); asks.update { l -> l.filterNot { (it.id as? JsonPrimitive)?.content == id } } }
+            // the server's lists moved: screens showing them refetch instead of polling
+            "sessions.changed" -> sessionsChanged.update { it + 1 }
+            "cron.changed" -> cronChanged.update { it + 1 }
+            "notification.show" -> {
+                val t = pl.s("text")
+                if (t.isNotBlank() && mine(sid)) toasts.tryEmit(HermesToast(t, pl.s("level"), pl.sn("key") ?: pl.sn("id"), pl.l("ttl_ms")))
+            }
+            "notification.clear" -> pl.sn("key")?.let { clearedToasts.tryEmit(it) }
+            "background.complete" -> {
+                val q = pl.sn("question").orEmpty()
+                val t = pl.s("text")
+                val ours = mine(sid) || pl.s("task_id") in backgroundTasks
+                if (ours) {
+                    backgroundTasks.remove(pl.s("task_id"))
+                    items.update { it + ChatItem.Output(k("o"), "background" + if (q.isNotBlank()) " · " + q.take(60) else "", t.ifBlank { "(no output)" }) }
+                    backgroundDone.tryEmit(q.ifBlank { "Background task" } to t)
+                }
+            }
             "skin.changed" -> {}
             else -> if (mine(sid)) onSessionEvent(type, pl, sid.isNotBlank())
         }
@@ -415,6 +459,15 @@ class Gateway(private val api: Api, private val store: Store) {
         }
         when (type) {
             "btw.complete" -> items.update { it + ChatItem.Output(k("o"), "btw · " + pl.s("question").take(60), pl.s("text")) }
+            "todo.updated" -> applyTodos(pl.a("todos"), pl.l("revision"))
+            "subagent.spawn_requested", "subagent.start", "subagent.thinking", "subagent.tool", "subagent.progress", "subagent.complete" -> onSubagent(type, pl)
+            "session.control.update" -> control.value = pl.o("control")
+            "review.summary" -> pl.s("text").takeIf { it.isNotBlank() }?.let { t -> items.update { it + ChatItem.Output(k("o"), "review", t) } }
+            "tool.output_risk" -> {
+                val key = "t-" + pl.s("tool_id")
+                val f = pl.a("findings").strs()
+                items.update { l -> l.map { if (it is ChatItem.Tool && it.key == key) it.copy(risk = pl.s("risk").ifBlank { "risky" }, findings = f) else it } }
+            }
             "message.start" -> {
                 val wasIdle = !busy.value
                 busy.value = true
@@ -449,6 +502,7 @@ class Gateway(private val api: Api, private val store: Store) {
                 status.value = ""
             }
             "tool.complete" -> {
+                if (pl["todos"] is JsonArray) applyTodos(pl.a("todos"), pl.l("revision"))
                 val key = "t-" + pl.s("tool_id")
                 items.update { l -> l.map { if (it is ChatItem.Tool && it.key == key) it.copy(done = true, summary = pl.s("summary"), duration = pl.d("duration_s"), endMs = now()) else it } }
             }
@@ -457,11 +511,13 @@ class Gateway(private val api: Api, private val store: Store) {
                 "compacted", "ready" -> if (!busy.value || status.value == "Compressing…") status.value = ""
                 // a background process is about to report back: name the turn it starts after it
                 "process" -> serverTurnLabel = pl.s("text").trim().takeIf { it.isNotBlank() }
+                // goal / loop / heartbeat moved: the control strip re-reads the snapshot
+                "goal", "loop", "heartbeat" -> scope.launch { runCatching { loadControl() } }
                 else -> if (busy.value) status.value = pl.s("text")
             }
             "message.reaction" -> applyReactions(pl.l("row_id"), parseReactions(pl["reactions"]), pl.s("role"))
             "session.usage" -> usage.value = pl.o("usage")
-            "session.title" -> { title.value = pl.s("title").ifBlank { title.value }; runCatching { store.lastChatTitle = title.value } }
+            "session.title" -> { title.value = pl.s("title").ifBlank { title.value }; runCatching { if (isActive) store.lastChatTitle = title.value } }
             "session.info" -> { applyInfo(pl, allowMove = targeted) }
             "message.complete" -> {
                 val text = pl["text"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: ""
@@ -712,6 +768,14 @@ class Gateway(private val api: Api, private val store: Store) {
             if (waiting.none { it.method == "approval" }) waiting += ServerAsk(JsonPrimitive("resume-approval:$rid"), "approval", pa)
         }
         if (waiting.isNotEmpty()) asks.update { l -> l + waiting.filter { w -> l.none { it.id == w.id } } }
+        r.o("todo_state")?.let { applyTodos(it.a("todos"), it.l("revision")) }
+        if (!sameChat) { subagents.value = emptyMap(); control.value = null }
+        val sid = runtimeSid
+        scope.launch {
+            runCatching { loadControl() }
+            // children already running when we (re)attached: seed the live list once, events keep it current
+            runCatching { if (sid == runtimeSid) seedSubagents() }
+        }
     }
 
     /** A transcript timestamp (epoch seconds/ms or ISO) to millis; 0 when absent. */
@@ -844,7 +908,7 @@ class Gateway(private val api: Api, private val store: Store) {
         val r = rpc("complete.path", buildJsonObject {
             put("word", word)
             if (runtimeSid.isNotBlank()) put("session_id", runtimeSid)
-            store.profile.value.takeIf { it.isNotBlank() }?.let { put("profile", it) }
+            profileNow().takeIf { it.isNotBlank() }?.let { put("profile", it) }
         })
         return r.a("items").objs().map { SlashHint(it.s("text"), it.sn("display") ?: it.s("text"), it.s("meta"), false) }
     }
@@ -853,8 +917,9 @@ class Gateway(private val api: Api, private val store: Store) {
         loadingSession.value = true
         try {
             items.value = emptyList(); title.value = "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
-            val p = store.profile.value
-            runCatching { store.lastChatTitle = "" }
+            val p = profileNow()
+            todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
+            runCatching { if (isActive) store.lastChatTitle = "" }
             fastAssertFor = ""
             // the speed rides on create itself; a config.set before the agent is built would be dropped
             // one key per new chat, so a retry after a lost reply can't mint a second session
@@ -872,7 +937,8 @@ class Gateway(private val api: Api, private val store: Store) {
         loadingSession.value = true
         try {
             items.value = emptyList(); title.value = t?.ifBlank { null } ?: "Chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
-            runCatching { store.lastChatTitle = t.orEmpty() }
+            runCatching { if (isActive) store.lastChatTitle = t.orEmpty() }
+            todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
             storedSid = stored
             applySnapshot(resumeRpc(stored))
             runCatching { loadRunSettings() }
@@ -964,7 +1030,7 @@ class Gateway(private val api: Api, private val store: Store) {
     val catalog = MutableStateFlow<List<SlashHint>>(emptyList())
     suspend fun loadCatalog(force: Boolean = false) {
         if (catalog.value.isNotEmpty() && !force) return
-        val r = rpc("commands.catalog", jsonOf("session_id" to runtimeSid.ifBlank { null }, "profile" to store.profile.value.ifBlank { null }))
+        val r = rpc("commands.catalog", jsonOf("session_id" to runtimeSid.ifBlank { null }, "profile" to profileNow().ifBlank { null }))
         val skills = r.o("skills")?.keys ?: emptySet()
         val usage = r.o("skills")?.mapValues { (it.value as? JsonObject)?.l("usage") ?: 0L } ?: emptyMap()
         catalog.value = r.a("pairs").mapNotNull { (it as? JsonArray)?.takeIf { a -> a.size >= 1 } }.map { a ->
@@ -1005,7 +1071,7 @@ class Gateway(private val api: Api, private val store: Store) {
 
     /** Completions for the text being typed; second value is where the replacement starts. */
     suspend fun completeSlash(text: String): Pair<List<SlashHint>, Int> {
-        val r = rpc("complete.slash", jsonOf("text" to text, "session_id" to runtimeSid.ifBlank { null }, "profile" to store.profile.value.ifBlank { null }))
+        val r = rpc("complete.slash", jsonOf("text" to text, "session_id" to runtimeSid.ifBlank { null }, "profile" to profileNow().ifBlank { null }))
         val hints = r.a("items").objs().map { SlashHint(it.s("text"), it.s("display").ifBlank { it.s("text") }, it.s("meta"), it.s("kind") == "skill") }
         return hints to r.l("replace_from").toInt()
     }
@@ -1091,11 +1157,6 @@ class Gateway(private val api: Api, private val store: Store) {
         items.update { it + ChatItem.Notice(k("n"), "Couldn't edit: " + (lastErr?.message ?: "unknown error"), true) }
     }
 
-    /** Runs the last message again for a fresh answer. */
-    suspend fun regenerate() {
-        val last = items.value.filterIsInstance<ChatItem.User>().lastOrNull() ?: return
-        edit(last, last.raw)
-    }
 
     suspend fun rename(t: String) {
         rpc("session.title", jsonOf("session_id" to runtimeSid, "title" to t))
@@ -1190,5 +1251,199 @@ class Gateway(private val api: Api, private val store: Store) {
         asks.update { l -> l.filterNot { it.id == ask.id } }
     }
 
-    fun reset() { disconnect(); runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat" }
+
+    // ── approvals and vault asks ─────────────────────────────────────────────
+
+    private val acked = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** The approval card is on screen: tell Hermes, which starts its timeout clock from now (not from when it asked). */
+    fun ackApproval(ask: ServerAsk) {
+        if (ask.method != "approval") return
+        val rid = ask.params.sn("request_id")?.takeIf { it.isNotBlank() }
+            ?: (ask.id as? JsonPrimitive)?.content?.removePrefix("resume-approval:")?.takeIf { it.isNotBlank() } ?: return
+        if (!acked.add(rid)) return
+        val sid = runtimeSid
+        scope.launch { runCatching { rpc("approval.received", jsonOf("session_id" to sid, "request_id" to rid)) } }
+    }
+
+    // ── todos, subagents, goals ──────────────────────────────────────────────
+
+    val todos = MutableStateFlow<List<Todo>>(emptyList())
+    private var todoRev = -1L
+    private fun applyTodos(arr: JsonArray, rev: Long) {
+        if (rev in 1 until todoRev) return   // an older snapshot arriving late
+        todoRev = rev
+        todos.value = arr.mapIndexedNotNull { i, e ->
+            val o = e as? JsonObject ?: return@mapIndexedNotNull (e as? JsonPrimitive)?.contentOrNull?.let { Todo("$i", it, "pending") }
+            val text = o.sn("content") ?: o.sn("text") ?: o.sn("title") ?: o.sn("task") ?: return@mapIndexedNotNull null
+            Todo(o.sn("id") ?: "$i", text, (o.sn("status") ?: if (o.b("done") || o.b("completed")) "completed" else "pending").lowercase())
+        }
+    }
+
+    /** Live delegated children of this chat, by id, fed by subagent.* events. */
+    val subagents = MutableStateFlow<Map<String, Subagent>>(emptyMap())
+    private fun onSubagent(type: String, pl: JsonObject) {
+        val id = pl.sn("subagent_id")?.takeIf { it.isNotBlank() } ?: ("task-" + pl.l("task_index"))
+        val st = pl.sn("status")?.takeIf { it.isNotBlank() } ?: when (type) {
+            "subagent.spawn_requested" -> "queued"
+            "subagent.complete" -> "completed"
+            else -> "running"
+        }
+        subagents.update { m ->
+            val old = m[id]
+            m + (id to Subagent(
+                id = id, goal = pl.sn("goal")?.takeIf { it.isNotBlank() } ?: old?.goal.orEmpty(), status = st,
+                model = pl.sn("model") ?: old?.model.orEmpty(), depth = pl["depth"]?.let { pl.l("depth").toInt() } ?: old?.depth ?: 0,
+                toolCount = pl["tool_count"]?.let { pl.l("tool_count").toInt() } ?: old?.toolCount ?: 0,
+                lastTool = (if (type == "subagent.tool") pl.sn("tool_name") ?: pl.sn("name") ?: pl.sn("text") else null) ?: old?.lastTool.orEmpty(),
+                summary = pl.sn("summary") ?: pl.sn("output_tail") ?: old?.summary.orEmpty(),
+                startedAt = old?.startedAt?.takeIf { it > 0 } ?: now(),
+                endedAt = if (type == "subagent.complete") now() else old?.endedAt ?: 0,
+                inTok = pl["input_tokens"]?.let { pl.l("input_tokens") } ?: old?.inTok ?: 0,
+                outTok = pl["output_tokens"]?.let { pl.l("output_tokens") } ?: old?.outTok ?: 0,
+            ))
+        }
+    }
+    /** One read when you open a chat that already has children running; events take over from there. */
+    suspend fun seedSubagents() {
+        if (runtimeSid.isBlank()) return
+        val r = rpc("subagent.list", jsonOf("session_id" to runtimeSid))
+        val live = r.a("subagents").objs().associate { o ->
+            val id = o.s("subagent_id")
+            id to Subagent(id, o.s("goal"), o.sn("status") ?: "running", o.s("model"), o.l("depth").toInt(), o.l("tool_count").toInt(), o.s("last_tool"),
+                startedAt = serverTime(o["started_at"]) ?: now())
+        }
+        subagents.update { m -> m.filterValues { it.done } + live }
+    }
+    suspend fun delegationStatus(): JsonObject = rpc("delegation.status", JsonObject(emptyMap()))
+    suspend fun pauseDelegation(paused: Boolean): Boolean = rpc("delegation.pause", jsonOf("paused" to paused)).b("paused")
+
+    /** Goal / loop / heartbeat snapshot for this chat (null when none of them is set). */
+    val control = MutableStateFlow<JsonObject?>(null)
+    suspend fun loadControl() {
+        if (runtimeSid.isBlank()) return
+        control.value = rpc("session.control.read", jsonOf("session_id" to runtimeSid)).o("control")
+    }
+    /** goal.pause/resume/clear/unwait, loop.pause/resume/stop, heartbeat.pause/resume/clear, subgoal.* */
+    suspend fun controlAction(action: String, text: String? = null, index: Int? = null): String? {
+        val r = rpc("session.control", buildJsonObject {
+            put("session_id", runtimeSid); put("action", action)
+            if (text != null || index != null) put("args", buildJsonObject { text?.let { put("text", it) }; index?.let { put("index", it) } })
+        })
+        r.o("control")?.let { control.value = it }
+        return r.o("dispatch")?.let { d -> d.sn("notice") ?: d.sn("message") ?: d.sn("output") }?.takeIf { it.isNotBlank() }
+    }
+
+    suspend fun contextBreakdown(): JsonObject = rpc("session.context_breakdown", jsonOf("session_id" to runtimeSid))
+
+    // ── checkpoints ──────────────────────────────────────────────────────────
+
+    suspend fun checkpoints(): JsonObject = rpc("rollback.list", jsonOf("session_id" to runtimeSid))
+    suspend fun checkpointDiff(hash: String): JsonObject = rpc("rollback.diff", jsonOf("session_id" to runtimeSid, "hash" to hash))
+    suspend fun restoreCheckpoint(hash: String, file: String? = null): JsonObject {
+        val r = rpc("rollback.restore", jsonOf("session_id" to runtimeSid, "hash" to hash, "file_path" to file?.ifBlank { null }))
+        if (!r.b("success")) throw IllegalStateException(r.sn("error") ?: r.sn("reason") ?: "Couldn't restore that checkpoint")
+        // a full restore also rewinds the conversation: reload it so the transcript matches the files
+        if (r.l("history_removed") > 0 && storedSid.isNotBlank()) runCatching { val keep = storedSid; val s = resumeRpc(keep); if (storedSid == keep) applySnapshot(s) }
+        return r
+    }
+
+    // ── branch, undo, retry, redirect ────────────────────────────────────────
+
+    /** Fork this chat into a new one that shares its history so far, and switch to it. */
+    suspend fun branch(name: String? = null) {
+        if (runtimeSid.isBlank()) return
+        loadingSession.value = true
+        try {
+            val r = rpc("session.branch", jsonOf("session_id" to runtimeSid, "name" to name?.ifBlank { null }, "idempotency_key" to java.util.UUID.randomUUID().toString()))
+            val wasMine = store.isMine(storedSid)
+            todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
+            storedSid = r.s("stored_session_id")
+            if (wasMine) store.markMine(storedSid)
+            title.value = r.sn("title")?.ifBlank { null } ?: name?.ifBlank { null } ?: "Branch"
+            runCatching { if (isActive) store.lastChatTitle = title.value }
+            applySnapshot(r)
+            items.update { it + ChatItem.Notice(k("n"), "Branched from “${r.sn("parent")?.take(40) ?: "the original"}”") }
+        } finally { loadingSession.value = false }
+    }
+
+    /** Drop the last turn you sent (and its reply) from this chat. */
+    suspend fun undo(): Int {
+        if (runtimeSid.isBlank()) return 0
+        if (busy.value) throw IllegalStateException("Stop the reply first, then undo")
+        val removed = rpc("session.undo", jsonOf("session_id" to runtimeSid, "intent" to "undo")).l("removed").toInt()
+        if (removed > 0) dropLastTurn()
+        return removed
+    }
+
+    private fun dropLastTurn(): ChatItem.User? {
+        val l = items.value
+        val i = l.indexOfLast { it is ChatItem.User }
+        if (i < 0) return null
+        val u = l[i] as ChatItem.User
+        items.value = l.take(i)
+        userSeen = u.ordinal.coerceAtLeast(0)
+        return u
+    }
+
+    /** Runs the last message again for a fresh answer: session.undo(retry) then the same text, falling back to an in-place edit. */
+    suspend fun regenerate() {
+        val last = items.value.filterIsInstance<ChatItem.User>().lastOrNull() ?: return
+        if (busy.value) { edit(last, last.raw); return }
+        val removed = try { rpc("session.undo", jsonOf("session_id" to runtimeSid, "intent" to "retry")).l("removed") } catch (e: RpcError) { -1L }
+        if (removed <= 0) { edit(last, last.raw); return }
+        dropLastTurn()
+        val key = k("u")
+        val ord = userSeen++
+        items.update { it + last.copy(key = key, rowId = null, ordinal = ord, reactions = emptyList()) }
+        busy.value = true
+        try {
+            val r = rpc("prompt.submit", jsonOf("session_id" to runtimeSid, "text" to last.raw))
+            r.l("user_row_id").takeIf { it > 0 }?.let { row -> items.update { l -> l.map { if (it is ChatItem.User && it.key == key) it.copy(rowId = row) else it } } }
+        } catch (e: Exception) {
+            busy.value = false
+            items.update { it + ChatItem.Notice(k("n"), e.message ?: "Couldn't retry", true) }
+        }
+    }
+
+    /** Replace what the running turn is doing with this instead (unlike steer, which adds to it). */
+    suspend fun redirect(text: String) {
+        val r = rpc("session.redirect", jsonOf("session_id" to runtimeSid, "text" to text))
+        when (r.s("status")) {
+            "rejected" -> throw IllegalStateException("Hermes couldn't redirect this turn. Queue it instead.")
+            "queued" -> items.update { it + ChatItem.Notice(k("n"), "↪ Redirect queued: " + text.take(120)) }
+            else -> items.update { it + ChatItem.Notice(k("n"), "↪ Redirected: " + text.take(120)) }
+        }
+    }
+
+    // ── background tasks ─────────────────────────────────────────────────────
+
+    private val backgroundTasks = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** A finished /background task: (question, answer), for the notification. */
+    val backgroundDone = kotlinx.coroutines.flow.MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 8)
+    /** Runs a task on a fresh agent that outlives this turn; its answer lands here and as a notification. */
+    suspend fun runInBackground(text: String) {
+        if (runtimeSid.isBlank()) newChat()
+        val id = rpc("prompt.background", jsonOf("session_id" to runtimeSid, "text" to text)).s("task_id")
+        if (id.isNotBlank()) backgroundTasks += id
+        items.update { it + ChatItem.Notice(k("n"), "Running in the background: " + text.take(100)) }
+    }
+
+    // ── out-of-band notices and list refreshes ───────────────────────────────
+
+    val toasts = kotlinx.coroutines.flow.MutableSharedFlow<HermesToast>(extraBufferCapacity = 8)
+    val clearedToasts = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 8)
+    /** Bumped on sessions.changed / cron.changed so lists refetch instead of polling. */
+    val sessionsChanged = MutableStateFlow(0)
+    val cronChanged = MutableStateFlow(0)
+
+    // ── settings Hermes keeps globally ───────────────────────────────────────
+
+    /** Whether Hermes reads your reactions on the next turn (config display.message_reactions). */
+    suspend fun reactionsVisible(): Boolean =
+        rpc("config.get", jsonOf("key" to "full")).o("config")?.o("display")?.let { (it["message_reactions"] as? JsonPrimitive)?.booleanOrNull } ?: false
+    suspend fun setReactionsVisible(on: Boolean): Boolean =
+        rpc("config.set", jsonOf("key" to "display.message_reactions", "value" to on)).let { r -> (r["value"] as? JsonPrimitive)?.booleanOrNull ?: on }
+
+    fun reset() { disconnect(); runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
+        todos.value = emptyList(); subagents.value = emptyMap(); control.value = null; asks.value = emptyList() }
 }

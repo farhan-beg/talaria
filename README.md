@@ -2,7 +2,7 @@
 
 An independent Android client for Hermes Agent servers.
 
-Version 1.14.11 (versionCode 28). Not affiliated with Nous Research.
+Version 1.14.12 (versionCode 29). Not affiliated with Nous Research.
 
 ## Screenshots
 

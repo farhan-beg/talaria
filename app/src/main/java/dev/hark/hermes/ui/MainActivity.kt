@@ -47,6 +47,24 @@ class MainActivity : ComponentActivity() {
             val ambient by app.store.ambient.collectAsStateWithLifecycle()
             HermesTheme(theme, preset, Look(glass, motion, ambient)) { Root() }
         }
+        openFrom(intent)
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        openFrom(intent)
+    }
+
+    /** A notification from a chat (possibly on another server): bring that server and that chat up. */
+    private fun openFrom(i: android.content.Intent?) {
+        val server = i?.getStringExtra(dev.hark.hermes.TurnService.EXTRA_SERVER).orEmpty()
+        val chat = i?.getStringExtra(dev.hark.hermes.TurnService.EXTRA_CHAT).orEmpty()
+        if (server.isBlank() && chat.isBlank()) return
+        i?.removeExtra(dev.hark.hermes.TurnService.EXTRA_SERVER); i?.removeExtra(dev.hark.hermes.TurnService.EXTRA_CHAT)
+        if (server.isNotBlank() && server != app.store.activeId.value && app.store.servers.value.any { it.id == server }) switchServer(server)
+        val g = app.gatewayFor(server.ifBlank { app.store.activeId.value })
+        if (chat.isNotBlank() && chat != g.storedSid) ChatNav.pendingResume.value = chat to null
+        NotifNav.openChat.value = true
     }
 
     override fun onResume() {
@@ -105,6 +123,9 @@ private val dock = listOf(
 )
 val tabRoutes = dock.map { it.route }
 
+/** Set when a notification asks for the chat tab. */
+object NotifNav { val openChat = kotlinx.coroutines.flow.MutableStateFlow(false) }
+
 /** Lets non-composable navigation (nav.go) switch the pager. */
 object TabBus { var select: ((String) -> Unit)? = null }
 
@@ -128,6 +149,7 @@ private fun Shell() {
         if (i >= 0) scope.launch { pager.animateScrollToPage(i, animationSpec = tabSpring) }
     }
     DisposableEffect(Unit) { TabBus.select = select; onDispose { TabBus.select = null } }
+    LaunchedEffect(Unit) { NotifNav.openChat.collect { if (it) { NotifNav.openChat.value = false; nav.popBackStack("tabs", false); select("chat") } } }
     androidx.activity.compose.BackHandler(enabled = onTab && pager.currentPage != 0) { select("home") }
 
     Box(Modifier.fillMaxSize()) {
@@ -150,7 +172,7 @@ private fun Shell() {
                         }) {
                             when (dock[page].route) {
                                 "home" -> HomeScreen(nav)
-                                "chat" -> ChatScreen(nav)
+                                "chat" -> { val ag by app.activeGateway.collectAsStateWithLifecycle(); key(ag) { ChatScreen(nav) } }
                                 "cron" -> CronScreen(nav)
                                 "sessions" -> SessionsScreen(nav)
                                 else -> MoreScreen(nav)
@@ -190,10 +212,10 @@ private fun Shell() {
             text = { Text("Your dashboard sign-in ran out. Sign in again to keep going.\n\n" + (app.api.lastAuthError ?: ""), color = p.muted) },
             confirmButton = {
                 TextButton({
-                    expired = false; app.gateway.reset(); app.store.signOut()
+                    expired = false; app.dropGateway(app.store.activeId.value); app.store.signOut()
                 }) { Text("Sign in again", color = p.accent) }
             },
-            dismissButton = { TextButton({ expired = false; app.gateway.reset(); app.store.signOut() }) { Text("Sign out", color = p.muted) } },
+            dismissButton = { TextButton({ expired = false; app.dropGateway(app.store.activeId.value); app.store.signOut() }) { Text("Sign out", color = p.muted) } },
         )
     }
 }

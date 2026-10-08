@@ -22,7 +22,8 @@ fun CronScreen(nav: NavHostController) {
     val p = LocalPalette.current
     val scope = rememberCoroutineScope()
     val profile by app.store.profile.collectAsState()
-    val jobs = rememberLoad(profile) { app.api.arr("/api/cron/jobs").objs() }
+    val cronMoved = rememberCronChanged()
+    val jobs = rememberLoad(profile, cronMoved) { app.api.arr("/api/cron/jobs").objs() }
     val targets = rememberLoad(profile) { runCatching { app.api.obj("/api/cron/delivery-targets").a("targets").objs() }.getOrDefault(emptyList()) }
     var edit by remember { mutableStateOf<JsonObject?>(null) }
     var creating by remember { mutableStateOf(false) }

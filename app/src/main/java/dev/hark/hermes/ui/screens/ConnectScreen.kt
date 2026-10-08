@@ -222,7 +222,7 @@ private fun PrimaryAction(text: String, icon: androidx.compose.ui.graphics.vecto
 
 /** Moves the whole app to another saved server: drops the live chat, swaps tokens, reconnects. */
 fun switchServer(id: String) {
-    app.gateway.reset()
+    // the server you leave keeps its own connection (and any chat running there); this one comes up beside it
     app.store.switchTo(id)
-    if (app.store.auth.value.isSignedIn) app.gateway.connect()
+    if (app.store.auth.value.isSignedIn) app.gatewayFor(id).connect()
 }

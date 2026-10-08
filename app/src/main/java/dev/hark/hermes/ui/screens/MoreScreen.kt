@@ -20,6 +20,7 @@ import androidx.navigation.NavHostController
 import dev.hark.hermes.app
 import dev.hark.hermes.data.*
 import dev.hark.hermes.ui.*
+import kotlinx.coroutines.launch
 
 private data class Dest(val route: String, val title: String, val sub: String, val icon: ImageVector, val tint: Long)
 
@@ -143,7 +144,8 @@ fun SettingsScreen(nav: NavHostController) {
                 SettingToggle("Markdown in my messages", "Format bar and live styling while typing; your sent messages render bold, lists, code and more", Icons.Outlined.TextFormat, mdIn) { app.store.set(app.store.markdownInput, "markdown_input", it) }
                 val interimOn by app.store.interimInReply.collectAsState()
                 SettingToggle("Full reply", "Words Hermes writes between tool calls show in the reply, not tucked into \"Worked for\"", Icons.Outlined.Notes, interimOn) { app.store.set(app.store.interimInReply, "interim_in_reply", it) }
-                                SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
+                SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
+                ReactionsSetting()
             }
         }
         item { SectionLabel("Sessions") }
@@ -172,16 +174,31 @@ fun SettingsScreen(nav: NavHostController) {
         item {
             HCard(padding = 8.dp) {
                 ListRow("Sign out", "Forget tokens on this phone", Icons.Outlined.Logout, p.bad, onClick = { signOut = true })
-                ListRow("Add server", "Connect another Hermes dashboard", Icons.Outlined.Add, onClick = { app.gateway.reset(); app.store.addServer() })
+                ListRow("Add server", "Connect another Hermes dashboard", Icons.Outlined.Add, onClick = { app.store.addServer() })
             }
         }
         item { Text("Talaria 1.14.0  ·  for Hermes Agent", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) }
     }
     if (signOut) ConfirmDialog("Sign out?", "You'll need to sign in with your dashboard OAuth again.", "Sign out", danger = true, { signOut = false }) {
-        app.gateway.reset(); app.store.signOut()
+        app.dropGateway(app.store.activeId.value); app.store.signOut()
     }
 }
 
+
+/** Hermes' own display.message_reactions: whether the agent reads your reactions on its next turn. Lives on the server, so it covers every client. */
+@Composable
+private fun ReactionsSetting() {
+    val scope = rememberCoroutineScope()
+    val g by app.activeGateway.collectAsState()
+    val conn by g.conn.collectAsState()
+    var on by remember(g) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(g, conn) { if (conn == Conn.Ready) on = runCatching { g.reactionsVisible() }.getOrNull() }
+    SettingToggle("Hermes sees my reactions", if (on == null) "Checking your Hermes…" else "Your ❤️ 👍 👎 reach Hermes on its next turn. Applies to every app on this Hermes", Icons.Outlined.AddReaction, on == true) { v ->
+        if (on == null) return@SettingToggle
+        val before = on; on = v
+        scope.launch { try { on = g.setReactionsVisible(v) } catch (e: Exception) { on = before; toast(errText(e)) } }
+    }
+}
 
 @Composable
 private fun SettingToggle(title: String, sub: String, icon: androidx.compose.ui.graphics.vector.ImageVector, checked: Boolean, onChange: (Boolean) -> Unit) {
@@ -259,7 +276,7 @@ private fun ServersCard() {
         AlertDialog({ removing = null }, containerColor = p.sheet,
             title = { Text("Remove ${sv.auth.label}?") },
             text = { Text("Its sign-in is forgotten on this phone. Nothing changes on the server.") },
-            confirmButton = { TextButton({ val wasActive = sv.id == active; if (wasActive) app.gateway.reset(); app.store.removeServer(sv.id); if (wasActive && app.store.auth.value.isSignedIn) app.gateway.connect(); removing = null }) { Text("Remove", color = p.bad) } },
+            confirmButton = { TextButton({ val wasActive = sv.id == active; app.dropGateway(sv.id); app.store.removeServer(sv.id); if (wasActive && app.store.auth.value.isSignedIn) app.gatewayFor(app.store.activeId.value).connect(); removing = null }) { Text("Remove", color = p.bad) } },
             dismissButton = { TextButton({ removing = null }) { Text("Cancel") } })
     }
 }

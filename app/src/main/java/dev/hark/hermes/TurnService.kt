@@ -94,8 +94,26 @@ class TurnService : Service() {
             nm.createNotificationChannel(NotificationChannel(CH_DONE, "Replies", NotificationManager.IMPORTANCE_DEFAULT).apply { description = "When a reply is ready" })
         }
 
-        fun openApp(ctx: Context): PendingIntent = PendingIntent.getActivity(ctx, 0,
-            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_IMMUTABLE)
+        fun openApp(ctx: Context, server: String = "", chat: String = ""): PendingIntent = PendingIntent.getActivity(ctx, (server + chat).hashCode(),
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                .putExtra(EXTRA_SERVER, server).putExtra(EXTRA_CHAT, chat), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        const val EXTRA_SERVER = "talaria.server"
+        const val EXTRA_CHAT = "talaria.chat"
+
+        /** A /background task finished. */
+        fun backgroundDone(ctx: Context, question: String, text: String, server: String, chat: String) {
+            ensureChannels(ctx)
+            val body = text.replace(Regex("[#*`>_]+"), "").trim().take(400).ifBlank { "Done." }
+            val n = NotificationCompat.Builder(ctx, CH_DONE)
+                .setSmallIcon(R.drawable.ic_notif)
+                .setContentTitle("Background task done · " + question.take(60))
+                .setContentText(body)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setAutoCancel(true)
+                .setContentIntent(openApp(ctx, server, chat))
+                .build()
+            runCatching { NotificationManagerCompat.from(ctx).notify(("bg" + question + text.length).hashCode(), n) }
+        }
 
         fun start(ctx: Context) {
             runCatching {
@@ -105,7 +123,7 @@ class TurnService : Service() {
         }
 
         /** "Reply ready" — only when you're not already looking at the app. */
-        fun replyReady(ctx: Context, title: String, status: String, text: String) {
+        fun replyReady(ctx: Context, title: String, status: String, text: String, server: String = "", chat: String = "") {
             ensureChannels(ctx)
             val (head, body) = when (status) {
                 "error" -> "Hermes hit a problem" to "Open the chat to see what went wrong."
@@ -118,9 +136,10 @@ class TurnService : Service() {
                 .setContentText(body)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
                 .setAutoCancel(true)
-                .setContentIntent(openApp(ctx))
+                .setContentIntent(openApp(ctx, server, chat))
                 .build()
-            runCatching { NotificationManagerCompat.from(ctx).notify(DONE_ID, n) }
+            // another server's chat gets its own notification so it doesn't replace this one's
+            runCatching { NotificationManagerCompat.from(ctx).notify(if (server.isBlank() || server == app.store.activeId.value) DONE_ID else DONE_ID + 1 + (server.hashCode() and 0xffff), n) }
         }
     }
 }

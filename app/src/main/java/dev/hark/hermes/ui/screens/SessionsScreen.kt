@@ -44,9 +44,10 @@ fun SessionsScreen(nav: NavHostController) {
     // the Automation/Subagents chips are an explicit ask, so they fetch everything
     val wantAll = bg || filter == "automation" || filter == "subagents" || filter == "all"
     val hideCli by app.store.hideCli.collectAsState()
-    val data = rememberLoad(profile, limit, debounced, wantAll, hideCli) {
+    val changed = rememberSessionsChanged()
+    val data = rememberLoad(profile, limit, debounced, wantAll, hideCli, filter == "archived", changed) {
         if (debounced.isNotBlank()) app.api.obj("/api/sessions/search?q=${Api.enc(debounced)}").a("results").objs()
-        else app.api.obj(sessionsUrl(limit, wantAll)).a("sessions").objs()
+        else app.api.obj(sessionsUrl(limit, wantAll, archived = filter == "archived")).a("sessions").objs()
     }
 
     Page("Sessions", refreshing = data.loading && data.data != null, onRefresh = { data.reload(); stats.reload() },
@@ -73,7 +74,7 @@ fun SessionsScreen(nav: NavHostController) {
                 Switch(bg, { app.store.set(app.store.showBackground, "show_background_sessions", it) })
             }
         }
-        if (debounced.isBlank()) item { ChipRow(listOf("chats" to "Chats", "automation" to "Automation", "subagents" to "Subagents", "all" to "All"), filter) { filter = it } }
+        if (debounced.isBlank()) item { ChipRow(listOf("chats" to "Chats", "automation" to "Automation", "subagents" to "Subagents", "archived" to "Archived", "all" to "All"), filter) { filter = it } }
         loadState(data) { list ->
             val byKind = if (debounced.isNotBlank()) list else list.filter {
                 when (filter) {
@@ -82,21 +83,21 @@ fun SessionsScreen(nav: NavHostController) {
                     "subagents" -> it.isSubagent()
                     else -> true
                 }
-            }
+            }.sortedByDescending { it.b("pinned") }
             // the Subagents chip is an explicit ask, so it ignores the hide setting
-            val shown = if (showHidden || filter == "subagents" || filter == "automation" || debounced.isNotBlank()) byKind else byKind.filter(visible)
+            val shown = if (showHidden || filter == "subagents" || filter == "automation" || filter == "archived" || debounced.isNotBlank()) byKind else byKind.filter(visible)
             val hiddenCount = byKind.size - shown.size
             if (hiddenCount > 0) item {
                 Text("$hiddenCount hidden by your settings · Show", color = p.muted, style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.press { showHidden = true }.padding(horizontal = 6.dp, vertical = 2.dp))
             }
-            if (shown.isEmpty()) item { EmptyCard(Icons.Outlined.SearchOff, "Nothing here", if (debounced.isBlank()) "No sessions match this filter." else "No messages match “$debounced”.") }
+            if (shown.isEmpty()) item { EmptyCard(Icons.Outlined.SearchOff, "Nothing here", if (debounced.isBlank()) (if (filter == "archived") "Nothing archived. Long-press a chat to archive it." else "No sessions match this filter.") else "No messages match “$debounced”.") }
             else item {
                 HCard(padding = 8.dp) {
                     shown.forEach { s ->
                         val id = s.sn("session_id") ?: s.s("id")
                         if (debounced.isNotBlank()) ListRow(s.sn("title") ?: id.take(12), s.s("snippet").replace(">>>", "").replace("<<<", ""), Icons.Outlined.FormatQuote) { nav.go("session/$id") }
-                        else SessionRow(s) { nav.go("session/$id") }
+                        else SessionRow(s, onChanged = { data.reload(); stats.reload() }) { nav.go("session/$id") }
                     }
                 }
             }

@@ -164,6 +164,28 @@ class Store(context: Context) {
         }
     }
 
+    /** A saved server's sign-in; the active one is the live copy. */
+    fun serverAuth(id: String): AuthState? = if (id.isNotBlank() && id == _activeId.value) _auth.value else _servers.value.firstOrNull { it.id == id }?.auth
+    /** Token refresh for a server that isn't the active one writes back to its own record. */
+    fun updateServer(id: String, block: (AuthState) -> AuthState) {
+        if (id == _activeId.value) { update(block); return }
+        writeServers(_servers.value.map { if (it.id == id) Server(id, block(it.auth)) else it })
+    }
+    fun serverLabel(id: String) = serverAuth(id)?.label.orEmpty()
+
+    /** Which saved server owns each chat, so its turns, asks and notifications route back to that connection. */
+    private val sessionServer: MutableMap<String, String> = runCatching {
+        Jsonx.parseToJsonElement(prefs.getString("session_servers", "{}") ?: "{}").let { it as kotlinx.serialization.json.JsonObject }
+            .mapValues { (it.value as kotlinx.serialization.json.JsonPrimitive).content }.toMutableMap()
+    }.getOrDefault(mutableMapOf())
+    @Synchronized fun tagSession(sid: String, server: String) {
+        if (sid.isBlank() || server.isBlank() || sessionServer[sid] == server) return
+        sessionServer[sid] = server
+        while (sessionServer.size > 3000) sessionServer.remove(sessionServer.keys.first())
+        prefs.edit().putString("session_servers", kotlinx.serialization.json.JsonObject(sessionServer.mapValues { kotlinx.serialization.json.JsonPrimitive(it.value) }).toString()).apply()
+    }
+    @Synchronized fun serverOf(sid: String): String? = sessionServer[sid]
+
     fun setProfile(p: String) { prefs.edit().putString("profile", p).apply(); _profile.value = p }
     fun setTheme(t: String) { prefs.edit().putString("theme", t).apply(); _theme.value = t }
 
@@ -207,6 +229,7 @@ class Store(context: Context) {
     var lastChat: String
         get() = prefs.getString("last_chat:" + _activeId.value + ":" + _profile.value, "") ?: ""
         set(v) { prefs.edit().putString("last_chat:" + _activeId.value + ":" + _profile.value, v).apply() }
+    fun setLastChat(server: String, profile: String, sid: String) { prefs.edit().putString("last_chat:$server:$profile", sid).apply() }
     var lastChatTitle: String
         get() = prefs.getString("last_chat_t:" + _activeId.value + ":" + _profile.value, "") ?: ""
         set(v) { prefs.edit().putString("last_chat_t:" + _activeId.value + ":" + _profile.value, v).apply() }

@@ -172,6 +172,35 @@ class Api(private val store: Store) {
     suspend fun obj(path: String, profile: Boolean = true): JsonObject = get(path, profile).objOrNull() ?: JsonObject(emptyMap())
     suspend fun arr(path: String, profile: Boolean = true): JsonArray = get(path, profile).arrOrEmpty()
 
+    /** A token for any saved server (one live socket each); the active server goes through the normal path. */
+    suspend fun accessTokenFor(server: String): String {
+        if (server.isBlank() || server == store.activeId.value) return accessToken()
+        val a = store.serverAuth(server) ?: return ""
+        if (a.refreshToken.isNotBlank() && a.expiresAt > 0 && a.expiresAt - 60 < System.currentTimeMillis() / 1000.0) refreshServer(server, a)
+        return store.serverAuth(server)?.accessToken.orEmpty()
+    }
+
+    private suspend fun refreshServer(server: String, a: AuthState): Boolean = refreshLock.withLock {
+        withContext(Dispatchers.IO) {
+            try {
+                val body = jsonOf("refresh_token" to a.refreshToken, "provider" to a.provider).toString().toRequestBody(JSONT)
+                val req = Request.Builder().url(a.baseUrl.trimEnd('/') + "/auth/native/refresh").post(body).build()
+                http.newCall(req).execute().use { r ->
+                    if (!r.isSuccessful) return@withContext false
+                    val o = Jsonx.parseToJsonElement(r.body!!.string()).jsonObject
+                    store.updateServer(server) { it.copy(accessToken = o.s("access_token"), refreshToken = o.sn("refresh_token") ?: it.refreshToken, expiresAt = o.d("expires_at")) }
+                    true
+                }
+            } catch (e: Exception) { false }
+        }
+    }
+
+    fun wsUrlFor(server: String, path: String, token: String): String {
+        if (server.isBlank() || server == store.activeId.value) return wsUrl(path, token)
+        val b = store.serverAuth(server)?.baseUrl.orEmpty().trimEnd('/').replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")
+        return "$b$path" + if (token.isNotBlank()) "?token=" + enc(token) else ""
+    }
+
     fun wsUrl(path: String, token: String, extra: String = ""): String {
         val b = base.replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")
         val q = buildString {

@@ -3,6 +3,7 @@ package dev.hark.hermes.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -19,6 +20,7 @@ import dev.hark.hermes.app
 import dev.hark.hermes.data.*
 import dev.hark.hermes.ui.*
 import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonObject
 
@@ -34,7 +36,8 @@ fun HomeScreen(nav: NavHostController) {
     val status = rememberLoad(profile, poll = 8000) { app.api.obj("/api/status", profile = false) }
     val bgSessions by app.store.showBackground.collectAsState()
     val hideCli by app.store.hideCli.collectAsState()
-    val sessions = rememberLoad(profile, bgSessions, hideCli) { app.api.obj(sessionsUrl(24, bgSessions)) }
+    val changed = rememberSessionsChanged()
+    val sessions = rememberLoad(profile, bgSessions, hideCli, changed) { app.api.obj(sessionsUrl(24, bgSessions)) }
     val visible = rememberSessionFilter()
     val model = rememberLoad(profile) { runCatching { app.api.obj("/api/model/info") }.getOrNull() }
     val sys = rememberLoad(server, poll = 15000) { runCatching { app.api.obj("/api/system/stats", profile = false) }.getOrNull() }
@@ -144,10 +147,10 @@ fun HomeScreen(nav: NavHostController) {
             }
         }
         loadState(sessions) { d ->
-            val list = d.a("sessions").objs().filter(visible).take(6)
+            val list = d.a("sessions").objs().filter(visible).sortedByDescending { it.b("pinned") }.take(6)
             if (list.isEmpty()) item { EmptyCard(Icons.Outlined.ChatBubbleOutline, "No sessions yet", "Start a chat and it'll show up here.") }
             else item {
-                HCard(padding = 8.dp) { list.forEach { SessionRow(it) { nav.go("session/${it.s("id")}") } } }
+                HCard(padding = 8.dp) { list.forEach { SessionRow(it, onChanged = { sessions.reload() }) { nav.go("session/${it.s("id")}") } } }
             }
         }
     }
@@ -186,10 +189,11 @@ fun JsonObject.isAutomation(): Boolean {
  */
 private val HIDDEN_SOURCES = listOf("acp", "api_server", "cron", "kanban", "oneshot", "tool", "recovered")
 private fun hiddenSources() = HIDDEN_SOURCES + if (app.store.hideCli.value) CLI_SOURCES else emptySet()
-fun sessionsUrl(limit: Int, background: Boolean = app.store.showBackground.value): String =
+fun sessionsUrl(limit: Int, background: Boolean = app.store.showBackground.value, archived: Boolean = false): String =
     // rows whose live source flipped slip past the server's filter and are dropped on the phone, so ask for extra
-    if (background) "/api/sessions?limit=$limit&offset=0&order=recent"
-    else "/api/sessions?limit=${(limit * 2).coerceAtMost(100)}&offset=0&order=recent&exclude_sources=" + hiddenSources().joinToString(",")
+    (if (background || archived) "/api/sessions?limit=$limit&offset=0&order=recent"
+    else "/api/sessions?limit=${(limit * 2).coerceAtMost(100)}&offset=0&order=recent&exclude_sources=" + hiddenSources().joinToString(",")) +
+        if (archived) "&archived=only" else ""
 
 /** The user's session-visibility settings, as a predicate. */
 @Composable
@@ -202,19 +206,59 @@ fun rememberSessionFilter(): (JsonObject) -> Boolean {
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun SessionRow(s: JsonObject, onClick: () -> Unit) {
+fun SessionRow(s: JsonObject, onChanged: (() -> Unit)? = null, onClick: () -> Unit) {
     val p = LocalPalette.current
+    val scope = rememberCoroutineScope()
     val title = s.sn("title") ?: s.sn("preview") ?: "Untitled"
     val mineIds by app.store.mineSessions.collectAsState()
     val mine = listOfNotNull(s.sn("id"), s.sn("session_id"), s.sn("_lineage_root_id")).any { it in mineIds }
-    ListRow(
-        title = title,
-        subtitle = listOfNotNull(if (mine) "Talaria" else s.sn("source"), s.sn("model"), "${s.l("message_count")} msgs", relTime(s.d("last_active"))).joinToString(" · "),
-        icon = if (mine) Icons.Outlined.PhoneAndroid else sourceIcon(s.s("source")),
-        trailing = { if (s.b("is_active")) Dot(p.good, pulse = true) },
-        onClick = onClick,
-    )
+    val id = s.sn("id") ?: s.s("session_id")
+    val profile = s.sn("profile")?.takeIf { it.isNotBlank() && it != "default" }
+    val pinned = s.b("pinned"); val archived = s.b("archived"); val hidden = s.b("hidden")
+    var menu by remember { mutableStateOf(false) }
+    // long-press: pin, archive or hide, the same switches Hermes Desktop has (PATCH /api/sessions/{id})
+    fun set(field: String, v: Boolean, done: String) { menu = false; scope.act(done, after = { onChanged?.invoke() }) { app.api.patch("/api/sessions/${Api.enc(id)}", jsonOf(field to v)) } }
+    Box(Modifier.combinedClickable(onClick = onClick, onLongClick = { if (onChanged != null) menu = true })) {
+        ListRow(
+            title = title,
+            subtitle = listOfNotNull(if (mine) "Talaria" else s.sn("source"), s.sn("model"), "${s.l("message_count")} msgs", relTime(s.d("last_active"))).joinToString(" · "),
+            icon = if (mine) Icons.Outlined.PhoneAndroid else sourceIcon(s.s("source")),
+            trailing = {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    profile?.let { Pill(it, p.muted) }
+                    if (archived) Icon(Icons.Outlined.Archive, "Archived", tint = p.faint, modifier = Modifier.size(15.dp))
+                    if (hidden) Icon(Icons.Outlined.VisibilityOff, "Hidden", tint = p.faint, modifier = Modifier.size(15.dp))
+                    if (pinned) Icon(Icons.Outlined.PushPin, "Pinned", tint = p.accent, modifier = Modifier.size(15.dp))
+                    if (s.b("is_active")) Dot(p.good, pulse = true)
+                }
+            },
+            onClick = null,
+        )
+        DropdownMenu(menu, { menu = false }, containerColor = p.sheet) {
+            DropdownMenuItem({ Text(if (pinned) "Unpin" else "Pin") }, { set("pinned", !pinned, if (pinned) "Unpinned" else "Pinned") }, leadingIcon = { Icon(Icons.Outlined.PushPin, null) })
+            DropdownMenuItem({ Text(if (archived) "Unarchive" else "Archive") }, { set("archived", !archived, if (archived) "Back in your chats" else "Archived") }, leadingIcon = { Icon(if (archived) Icons.Outlined.Unarchive else Icons.Outlined.Archive, null) })
+            DropdownMenuItem({ Text(if (hidden) "Unhide" else "Hide") }, { set("hidden", !hidden, if (hidden) "Unhidden" else "Hidden from your lists") }, leadingIcon = { Icon(if (hidden) Icons.Outlined.Visibility else Icons.Outlined.VisibilityOff, null) })
+        }
+    }
+}
+
+/** Ticks when Hermes says its session list moved (sessions.changed), settled so a burst reloads once. */
+@OptIn(kotlinx.coroutines.FlowPreview::class)
+@Composable
+fun rememberSessionsChanged(): Int {
+    val g by app.activeGateway.collectAsState()
+    val f = remember(g) { g.sessionsChanged.debounce(700) }
+    return f.collectAsState(g.sessionsChanged.value).value
+}
+
+@OptIn(kotlinx.coroutines.FlowPreview::class)
+@Composable
+fun rememberCronChanged(): Int {
+    val g by app.activeGateway.collectAsState()
+    val f = remember(g) { g.cronChanged.debounce(700) }
+    return f.collectAsState(g.cronChanged.value).value
 }
 
 fun sourceIcon(src: String) = when (src.lowercase()) {
@@ -247,7 +291,7 @@ fun ServerSwitcher(nav: NavHostController) {
                 )
             }
             HorizontalDivider(color = p.line)
-            DropdownMenuItem({ Text("Add server") }, { open = false; app.gateway.reset(); app.store.addServer() }, leadingIcon = { Icon(Icons.Outlined.Add, null) })
+            DropdownMenuItem({ Text("Add server") }, { open = false; app.store.addServer() }, leadingIcon = { Icon(Icons.Outlined.Add, null) })
             DropdownMenuItem({ Text("Manage servers") }, { open = false; nav.go("settings") }, leadingIcon = { Icon(Icons.Outlined.Settings, null) })
         }
     }

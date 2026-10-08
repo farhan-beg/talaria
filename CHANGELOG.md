@@ -3,6 +3,22 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.12] - 2026-10-08 (versionCode 29)
+
+Fixes for the 11 tracked issues (#1-#11):
+
+- Approvals: the card tells Hermes it's on screen (`approval.received`), so the timeout starts when you see it.
+- Vault: `vault.save_login` asks with a username + password card; `vault.code` and password-manager unlock cards name the site (and show the hint when given).
+- Chat menu: Branch chat (`session.branch`), Undo last turn (`session.undo`); regenerate now uses the `session.undo` retry; while a reply runs, a Redirect chip (`session.redirect`) sits beside Steer and Queue.
+- Subagents: live updates from `subagent.*` events (status, tools, tokens, summary), one list read on open, and a toggle to pause new spawns.
+- Todo checklist strip above the composer (`todo.updated`, `tool.complete.todos`, resumes from `todo_state`).
+- Run in background (`prompt.background`); the result lands in the chat and as a notification (`background.complete`).
+- Sessions: long-press to pin, archive or hide; an Archived filter, a profile chip, pinned chats float to the top; lists refresh on `sessions.changed`, Tasks on `cron.changed`.
+- Goal, loop and heartbeat strip with pause, resume and clear (`session.control*`); context usage sheet (`session.context_breakdown`); checkpoints sheet with diff and restore (`rollback.*`).
+- Hermes' toasts (`notification.show` / `notification.clear`); review summaries appear in the chat; risky tool output gets a red badge (`tool.output_risk`).
+- One connection per saved server: switching keeps the old socket and its open chat running, notifications name the server and open the right chat on tap, and each chat is tagged with its server.
+- More > For nerds: "Hermes sees my reactions" syncs `display.message_reactions`.
+
 ## [1.14.11] - 2026-10-07 (versionCode 28)
 
 ### Fixed

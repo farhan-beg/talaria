@@ -79,6 +79,13 @@ fun ChatScreen(nav: NavHostController) {
     var renaming by remember { mutableStateOf(false) }
     val showSubs by SubagentSheetState.open.collectAsStateWithLifecycle()
     var askBtw by remember { mutableStateOf(false) }
+    var askBackground by remember { mutableStateOf(false) }
+    var askBranch by remember { mutableStateOf(false) }
+    var showContext by remember { mutableStateOf(false) }
+    var showCheckpoints by remember { mutableStateOf(false) }
+    // notices Hermes pushes out of band (notification.show), as toasts; a clear withdraws the one showing
+    LaunchedEffect(g) { g.toasts.collect { t -> scope.toast(t.text) } }
+    LaunchedEffect(g) { g.clearedToasts.collect { Toaster.host.currentSnackbarData?.dismiss() } }
     val yolo by g.yolo.collectAsStateWithLifecycle()
     val attachments by g.attachments.collectAsStateWithLifecycle()
     var uploading by remember { mutableStateOf(0) }
@@ -271,6 +278,11 @@ fun ChatScreen(nav: NavHostController) {
                     DropdownMenuItem({ Text("Side question (btw)") }, { menu = false; askBtw = true }, leadingIcon = { Icon(Icons.Outlined.QuestionAnswer, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Subagents") }, { menu = false; SubagentSheetState.open.value = true }, leadingIcon = { Icon(Icons.Outlined.AccountTree, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Compress context") }, { go { toast(g.compress()) } }, leadingIcon = { Icon(Icons.Outlined.Compress, null) }, enabled = ready && !busy)
+                    DropdownMenuItem({ Text("Context usage") }, { menu = false; showContext = true }, leadingIcon = { Icon(Icons.Outlined.DonutLarge, null) }, enabled = ready)
+                    DropdownMenuItem({ Text("Run in background") }, { menu = false; askBackground = true }, leadingIcon = { Icon(Icons.Outlined.RocketLaunch, null) }, enabled = conn == Conn.Ready)
+                    DropdownMenuItem({ Text("Branch chat") }, { menu = false; askBranch = true }, leadingIcon = { Icon(Icons.Outlined.CallSplit, null) }, enabled = ready && !busy)
+                    DropdownMenuItem({ Text("Undo last turn") }, { go { val n = g.undo(); toast(if (n > 0) "Removed the last turn" else "Nothing to undo") } }, leadingIcon = { Icon(Icons.AutoMirrored.Outlined.Undo, null) }, enabled = ready && !busy && items.any { it is ChatItem.User })
+                    DropdownMenuItem({ Text("Checkpoints") }, { menu = false; showCheckpoints = true }, leadingIcon = { Icon(Icons.Outlined.Restore, null) }, enabled = ready)
                 }
             }
             Box(Modifier.size(40.dp).press { scope.launch { try { g.newChat() } catch (e: Exception) { toast(errText(e)) } } }.glass(CircleShape, p.accentSoft),
@@ -313,6 +325,8 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
 
+        GoalStrip()
+        TodoStrip()
         asks.firstOrNull()?.let { AskCard(it) }
 
         // slash command suggestions
@@ -358,13 +372,20 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
         AnimatedVisibility(busy && input.isNotBlank() && !input.startsWith("/"), enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-            Row(Modifier.padding(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.padding(horizontal = 14.dp, vertical = 4.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Row(Modifier.clip(RoundedCornerShape(50)).background(p.accent).clickable {
                     val t = input.trim(); input = ""
                     scope.launch { try { g.steer(t) } catch (e: Exception) { g.enqueue(t); toast("Couldn't steer, so it's queued for after this turn") } }
                 }.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.AutoMirrored.Outlined.Send, null, tint = p.accentInk, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(6.dp))
                     Text("Steer now", color = p.accentInk, style = MaterialTheme.typography.labelLarge)
+                }
+                Row(Modifier.clip(RoundedCornerShape(50)).background(p.accentSoft).clickable {
+                    val t = input.trim(); input = ""
+                    scope.launch { try { g.redirect(t) } catch (e: Exception) { g.enqueue(t); toast(errText(e)) } }
+                }.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.AltRoute, null, tint = p.ink, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(6.dp))
+                    Text("Redirect", color = p.ink, style = MaterialTheme.typography.labelLarge)
                 }
                 Row(Modifier.clip(RoundedCornerShape(50)).background(p.accentSoft).clickable { g.enqueue(input.trim()); input = "" }
                     .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -521,18 +542,27 @@ fun ChatScreen(nav: NavHostController) {
         askBtw = false; scope.launch { try { g.btw(t) } catch (e: Exception) { toast(errText(e)) } }
     }
     if (showSubs) SubagentSheet { SubagentSheetState.open.value = false }
+    if (askBackground) TextPrompt("Run in background", "", "Start", note = "A separate agent works on this while you keep chatting. You'll get a notification when it's done.", onDismiss = { askBackground = false }) { t ->
+        askBackground = false; scope.launch { try { g.runInBackground(t) } catch (e: Exception) { toast(errText(e)) } }
+    }
+    if (askBranch) TextPrompt("Branch chat", "", "Branch", note = "Starts a new chat with this one's history so far. The original stays as it is.", onDismiss = { askBranch = false }) { t ->
+        askBranch = false; scope.launch { try { g.branch(t) } catch (e: Exception) { toast(errText(e)) } }
+    }
+    if (showContext) ContextSheet { showContext = false }
+    if (showCheckpoints) CheckpointSheet { showCheckpoints = false }
     if (showModels) ModelSheet { showModels = false }
 
     if (showHistory) {
         ModalBottomSheet({ showHistory = false }, containerColor = p.sheet) {
-            val sessions = rememberLoad { app.api.obj(sessionsUrl(50)) }
+            val changed = rememberSessionsChanged()
+            val sessions = rememberLoad(changed) { app.api.obj(sessionsUrl(50)) }
             val visible = rememberSessionFilter()
             Text("Conversations", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
             Spacer(Modifier.height(8.dp))
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = 520.dp), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)) {
                 loadState(sessions) { d ->
-                    items(d.a("sessions").objs().filter(visible), key = { it.s("id") }) { s ->
-                        SessionRow(s) {
+                    items(d.a("sessions").objs().filter(visible).sortedByDescending { it.b("pinned") }, key = { it.s("id") }) { s ->
+                        SessionRow(s, onChanged = { sessions.reload() }) {
                             showHistory = false
                             scope.launch { try { g.resume(s.s("id"), s.sn("title")) } catch (e: Exception) { toast(errText(e)) } }
                         }
@@ -696,6 +726,8 @@ private fun AskCard(ask: ServerAsk) {
     val p = LocalPalette.current
     val g = app.gateway
     val pr = ask.params
+    // the card is on screen now: Hermes starts its approval timeout from this moment
+    LaunchedEffect(ask.id) { g.ackApproval(ask) }
     Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp).fillMaxWidth().clip(CardShape).background(p.card)
         .border(1.5.dp, p.warn.copy(alpha = 0.6f), CardShape).padding(16.dp)) {
         when (ask.method) {
@@ -752,9 +784,35 @@ private fun AskCard(ask: ServerAsk) {
                     SoftButton("Skip") { g.answer(ask, JsonObject(emptyMap())) }
                 }
             }
+            "vault.save_login" -> {
+                var user by remember(ask) { mutableStateOf("") }
+                var pass by remember(ask) { mutableStateOf("") }
+                val site = pr.s("site").ifBlank { pr.s("origin") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Key, null, tint = p.warn); Spacer(Modifier.width(8.dp))
+                    Text("Save a login for $site?", style = MaterialTheme.typography.titleSmall, color = p.ink)
+                }
+                if (pr.s("origin").isNotBlank() && pr.s("origin") != site) Text(pr.s("origin"), color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                Text("Hermes is about to sign in here and will keep this login in its vault.", color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                Spacer(Modifier.height(8.dp))
+                Field("Username or email", user, { user = it })
+                Field("Password", pass, { pass = it }, secret = true)
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SoftButton("Save", primary = true) { g.answer(ask, jsonOf("value" to jsonOf("identifier" to user.trim(), "password" to pass).toString())) }
+                    SoftButton("Decline") { g.answer(ask, jsonOf("value" to "")) }
+                }
+            }
             else -> {
                 var v by remember(ask) { mutableStateOf("") }
-                val label = when (ask.method) { "sudo" -> "Sudo password"; "secret" -> pr.s("prompt").ifBlank { pr.s("env_var") }; else -> ask.method }
+                val label = when (ask.method) {
+                    "sudo" -> "Sudo password"
+                    "secret" -> pr.s("prompt").ifBlank { pr.s("env_var") }
+                    "vault.code" -> "Code for " + pr.s("site").ifBlank { "this sign-in" }
+                    "vault.unlock_prompt" -> "Unlock " + pr.s("display_name").ifBlank { pr.s("backend").ifBlank { "your password manager" } }
+                    else -> ask.method
+                }
+                if (ask.method == "vault.code" && pr.s("hint").isNotBlank()) Text(pr.s("hint"), color = p.muted, style = MaterialTheme.typography.bodySmall)
                 Text(label, style = MaterialTheme.typography.titleSmall, color = p.ink)
                 if (ask.method == "sudo") CodeBlock(pr.s("command"), 120.dp)
                 Spacer(Modifier.height(8.dp))
@@ -904,53 +962,83 @@ private fun TextPrompt(title: String, initial: String, confirm: String, note: St
         dismissButton = { TextButton(onDismiss) { Text("Cancel", color = p.muted) } })
 }
 
-/** Live delegate_task children of this chat: watch, steer or stop them. */
+/** Live delegate_task children of this chat: kept current by subagent events, with steer and stop. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SubagentSheet(onClose: () -> Unit) {
     val p = LocalPalette.current
     val g = app.gateway
     val scope = rememberCoroutineScope()
-    var subs by remember { mutableStateOf<List<JsonObject>?>(null) }
+    val live by g.subagents.collectAsStateWithLifecycle()
+    var seeded by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf<String?>(null) }
     var openId by remember { mutableStateOf<String?>(null) }
     var tail by remember { mutableStateOf("") }
     var steer by remember { mutableStateOf("") }
+    var paused by remember { mutableStateOf<Boolean?>(null) }
+    // one read to catch children that started before this phone was listening; events do the rest
     LaunchedEffect(Unit) {
+        try { g.seedSubagents(); err = null } catch (e: Exception) { err = errText(e) }
+        seeded = true
+        runCatching { paused = g.delegationStatus().b("paused") }
+    }
+    // only the transcript of the child you opened is fetched, and only while it runs
+    LaunchedEffect(openId, live[openId]?.done) {
+        val id = openId ?: return@LaunchedEffect
         while (true) {
-            try { subs = g.subagents(); err = null } catch (e: Exception) { err = errText(e) }
-            openId?.let { id -> runCatching { tail = g.subagentTail(id) } }
+            runCatching { tail = g.subagentTail(id) }
+            if (live[id]?.done == true) break
             kotlinx.coroutines.delay(2500)
         }
     }
+    val subs = live.values.sortedWith(compareBy<Subagent> { it.done }.thenByDescending { it.startedAt })
     ModalBottomSheet(onClose, containerColor = p.sheet) {
-        Text("Subagents", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
+        Row(Modifier.padding(horizontal = 20.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Subagents", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.weight(1f))
+            paused?.let { pz ->
+                Text(if (pz) "New spawns paused" else "Spawning", color = p.muted, style = MaterialTheme.typography.labelMedium)
+                Spacer(Modifier.width(6.dp))
+                Switch(!pz, { on -> scope.launch { try { paused = g.pauseDelegation(!on) } catch (e: Exception) { toast(errText(e)) } } })
+            }
+        }
         Spacer(Modifier.height(8.dp))
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 600.dp), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             when {
-                err != null -> item { Text(err!!, color = p.bad) }
-                subs == null -> item { Box(Modifier.fillMaxWidth().padding(28.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = p.accent) } }
-                subs!!.isEmpty() -> item { Text("No subagents running in this chat.", color = p.muted, modifier = Modifier.padding(8.dp)) }
+                err != null && subs.isEmpty() -> item { Text(err!!, color = p.bad) }
+                !seeded && subs.isEmpty() -> item { Box(Modifier.fillMaxWidth().padding(28.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = p.accent) } }
+                subs.isEmpty() -> item { Text("No subagents in this chat yet.", color = p.muted, modifier = Modifier.padding(8.dp)) }
             }
-            items(subs.orEmpty(), key = { it.s("subagent_id") }) { sa ->
-                val id = sa.s("subagent_id")
-                val isOpen = openId == id
-                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(p.accentSoft.copy(alpha = 0.5f))
-                    .clickable { openId = if (isOpen) null else id; tail = "" ; if (!isOpen) scope.launch { runCatching { tail = g.subagentTail(id) } } }.padding(14.dp)) {
-                    Text(sa.s("goal").ifBlank { id }, color = p.ink, style = MaterialTheme.typography.bodyMedium, maxLines = if (isOpen) 6 else 2, overflow = TextOverflow.Ellipsis)
-                    Text(listOf(sa.s("model"), "depth ${sa.l("depth")}").filter { it.isNotBlank() }.joinToString(" · "), color = p.faint, style = MaterialTheme.typography.labelSmall)
+            items(subs, key = { it.id }) { sa ->
+                val isOpen = openId == sa.id
+                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(p.accentSoft.copy(alpha = if (sa.done) 0.25f else 0.5f))
+                    .clickable { openId = if (isOpen) null else sa.id; tail = "" }.padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        when {
+                            !sa.done -> CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = p.accent)
+                            sa.status == "completed" -> Icon(Icons.Outlined.Check, null, tint = p.good, modifier = Modifier.size(14.dp))
+                            else -> Icon(Icons.Outlined.ErrorOutline, null, tint = p.bad, modifier = Modifier.size(14.dp))
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(sa.goal.ifBlank { sa.id }, color = p.ink, style = MaterialTheme.typography.bodyMedium, maxLines = if (isOpen) 6 else 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    }
+                    val meta = listOf(sa.status, sa.model, if (sa.toolCount > 0) "${sa.toolCount} tools" else "", if (!sa.done && sa.lastTool.isNotBlank()) "now: " + friendlyTool(sa.lastTool) else "",
+                        if (sa.outTok > 0) humanTokens(sa.inTok + sa.outTok) + " tok" else "").filter { it.isNotBlank() }.joinToString(" · ")
+                    Text(meta, color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 2.dp))
                     AnimatedVisibility(isOpen) {
                         Column(Modifier.padding(top = 10.dp)) {
+                            if (sa.done && sa.summary.isNotBlank()) Text(sa.summary, color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(bottom = 8.dp))
                             Text(tail.takeLast(3000).ifBlank { "No output yet." }, color = p.muted, fontFamily = Mono, style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.5.sp),
                                 modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(rememberScrollState(), reverseScrolling = true))
-                            Spacer(Modifier.height(8.dp))
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                OutlinedTextField(steer, { steer = it }, placeholder = { Text("Steer it…") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1f))
-                                IconButton({ val t = steer; steer = ""; scope.launch { try { g.steerSubagent(id, t); toast("Sent") } catch (e: Exception) { toast(errText(e)) } } }, enabled = steer.isNotBlank()) {
-                                    Icon(Icons.AutoMirrored.Outlined.Send, "Steer", tint = p.accent)
-                                }
-                                IconButton({ scope.launch { try { g.stopSubagent(id); toast("Stopping") } catch (e: Exception) { toast(errText(e)) } } }) {
-                                    Icon(Icons.Outlined.StopCircle, "Stop", tint = p.bad)
+                            if (!sa.done) {
+                                Spacer(Modifier.height(8.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    OutlinedTextField(steer, { steer = it }, placeholder = { Text("Steer it…") }, singleLine = true, shape = RoundedCornerShape(14.dp), modifier = Modifier.weight(1f))
+                                    IconButton({ val t = steer; steer = ""; scope.launch { try { g.steerSubagent(sa.id, t); toast("Sent") } catch (e: Exception) { toast(errText(e)) } } }, enabled = steer.isNotBlank()) {
+                                        Icon(Icons.AutoMirrored.Outlined.Send, "Steer", tint = p.accent)
+                                    }
+                                    IconButton({ scope.launch { try { g.stopSubagent(sa.id); toast("Stopping") } catch (e: Exception) { toast(errText(e)) } } }) {
+                                        Icon(Icons.Outlined.StopCircle, "Stop", tint = p.bad)
+                                    }
                                 }
                             }
                         }
@@ -959,6 +1047,222 @@ private fun SubagentSheet(onClose: () -> Unit) {
             }
         }
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+/** The agent's own checklist (todo tool), folded to one line until you open it. */
+@Composable
+private fun TodoStrip() {
+    val p = LocalPalette.current
+    val todos by app.gateway.todos.collectAsStateWithLifecycle()
+    if (todos.isEmpty()) return
+    var open by remember { mutableStateOf(false) }
+    val done = todos.count { it.status == "completed" || it.status == "cancelled" }
+    val current = todos.firstOrNull { it.status == "in_progress" } ?: todos.firstOrNull { it.status == "pending" }
+    Column(Modifier.padding(horizontal = 14.dp, vertical = 3.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(p.accentSoft.copy(alpha = 0.45f))
+        .clickable { open = !open }.padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Checklist, null, tint = p.accent, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(8.dp))
+            Text("$done/${todos.size}", color = p.ink, style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(8.dp))
+            Text(if (done == todos.size) "All done" else current?.text.orEmpty(), color = p.muted, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Icon(if (open) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null, tint = p.faint, modifier = Modifier.size(18.dp))
+        }
+        LinearProgressIndicator({ done.toFloat() / todos.size }, Modifier.padding(top = 6.dp).fillMaxWidth().height(3.dp).clip(RoundedCornerShape(50)), color = p.accent, trackColor = p.faint.copy(alpha = 0.2f))
+        AnimatedVisibility(open) {
+            Column(Modifier.padding(top = 6.dp).heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
+                todos.forEach { t ->
+                    Row(Modifier.padding(vertical = 3.dp), verticalAlignment = Alignment.Top) {
+                        Icon(when (t.status) { "completed" -> Icons.Outlined.CheckCircle; "in_progress" -> Icons.Outlined.PlayCircleOutline; "cancelled" -> Icons.Outlined.Cancel; else -> Icons.Outlined.RadioButtonUnchecked },
+                            null, tint = when (t.status) { "completed" -> p.good; "in_progress" -> p.accent; else -> p.faint }, modifier = Modifier.size(16.dp).padding(top = 1.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(t.text, color = if (t.status == "completed" || t.status == "cancelled") p.faint else p.ink, style = MaterialTheme.typography.bodySmall,
+                            textDecoration = if (t.status == "cancelled") androidx.compose.ui.text.style.TextDecoration.LineThrough else null)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A standing goal, loop or heartbeat on this chat, with its controls. */
+@Composable
+private fun GoalStrip() {
+    val p = LocalPalette.current
+    val g = app.gateway
+    val scope = rememberCoroutineScope()
+    val c by g.control.collectAsStateWithLifecycle()
+    val ctl = c ?: return
+    val goal = ctl.o("goal")
+    val loop = ctl.o("loop")
+    val hb = ctl.o("heartbeat")
+    if (goal == null && loop == null && hb == null) return
+    fun act(a: String) = scope.launch { try { g.controlAction(a)?.let { toast(it) } } catch (e: Exception) { toast(errText(e)) } }
+    @Composable fun Line(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, sub: String, paused: Boolean, actions: @Composable RowScope.() -> Unit) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 3.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(p.accentSoft.copy(alpha = 0.45f))
+            .padding(start = 12.dp, end = 2.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, tint = if (paused) p.faint else p.accent, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(text, color = p.ink, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (sub.isNotBlank()) Text(sub, color = p.faint, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            actions()
+        }
+    }
+    goal?.let { gl ->
+        val st = gl.s("status")
+        val paused = st == "paused" || st == "waiting"
+        Line(Icons.Outlined.Flag, gl.s("title").ifBlank { "Goal" }, listOf(st, if (gl.l("max_turns") > 0) "turn ${gl.l("turns_used")}/${gl.l("max_turns")}" else "",
+            gl.a("subgoals").strs().size.takeIf { it > 0 }?.let { "$it subgoals" } ?: "", gl.sn("paused_reason").orEmpty()).filter { it.isNotBlank() }.joinToString(" · "), paused) {
+            if (st == "waiting") IconButton({ act("goal.unwait") }, Modifier.size(34.dp)) { Icon(Icons.Outlined.FastForward, "Stop waiting", tint = p.ink, modifier = Modifier.size(18.dp)) }
+            IconButton({ act(if (paused) "goal.resume" else "goal.pause") }, Modifier.size(34.dp)) { Icon(if (paused) Icons.Outlined.PlayArrow else Icons.Outlined.Pause, if (paused) "Resume goal" else "Pause goal", tint = p.ink, modifier = Modifier.size(18.dp)) }
+            IconButton({ act("goal.clear") }, Modifier.size(34.dp)) { Icon(Icons.Outlined.Close, "Clear goal", tint = p.faint, modifier = Modifier.size(18.dp)) }
+        }
+    }
+    loop?.let { lp ->
+        val paused = lp.s("status") == "paused"
+        val every = lp.l("interval_seconds").takeIf { it > 0 }?.let { "every " + fmtDur(it * 1000) } ?: lp.s("mode")
+        Line(Icons.Outlined.Repeat, lp.s("prompt").ifBlank { "Loop" }, listOf(lp.s("status"), every, if (lp.l("ticks_fired") > 0) "${lp.l("ticks_fired")} runs" else "").filter { it.isNotBlank() }.joinToString(" · "), paused) {
+            IconButton({ act(if (paused) "loop.resume" else "loop.pause") }, Modifier.size(34.dp)) { Icon(if (paused) Icons.Outlined.PlayArrow else Icons.Outlined.Pause, if (paused) "Resume loop" else "Pause loop", tint = p.ink, modifier = Modifier.size(18.dp)) }
+            IconButton({ act("loop.stop") }, Modifier.size(34.dp)) { Icon(Icons.Outlined.Close, "Stop loop", tint = p.faint, modifier = Modifier.size(18.dp)) }
+        }
+    }
+    hb?.let { h ->
+        val paused = h.s("status") == "paused"
+        Line(Icons.Outlined.MonitorHeart, h.s("prompt").ifBlank { "Heartbeat" }, listOf(h.s("status"), h.l("interval_seconds").takeIf { it > 0 }?.let { "every " + fmtDur(it * 1000) }.orEmpty(),
+            if (h.l("fire_count") > 0) "${h.l("fire_count")} beats" else "").filter { it.isNotBlank() }.joinToString(" · "), paused) {
+            IconButton({ act(if (paused) "heartbeat.resume" else "heartbeat.pause") }, Modifier.size(34.dp)) { Icon(if (paused) Icons.Outlined.PlayArrow else Icons.Outlined.Pause, if (paused) "Resume heartbeat" else "Pause heartbeat", tint = p.ink, modifier = Modifier.size(18.dp)) }
+            IconButton({ act("heartbeat.clear") }, Modifier.size(34.dp)) { Icon(Icons.Outlined.Close, "Clear heartbeat", tint = p.faint, modifier = Modifier.size(18.dp)) }
+        }
+    }
+}
+
+/** How full this chat's context window is, and what's filling it. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ContextSheet(onClose: () -> Unit) {
+    val p = LocalPalette.current
+    val g = app.gateway
+    val scope = rememberCoroutineScope()
+    val usage by g.usage.collectAsStateWithLifecycle()
+    var data by remember { mutableStateOf<JsonObject?>(null) }
+    var err by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) { try { data = g.contextBreakdown() } catch (e: Exception) { err = errText(e) } }
+    ModalBottomSheet(onClose, containerColor = p.sheet) {
+        Column(Modifier.padding(horizontal = 20.dp).verticalScroll(rememberScrollState())) {
+            Text("Context", style = MaterialTheme.typography.titleLarge, color = p.ink)
+            Spacer(Modifier.height(10.dp))
+            val d = data
+            when {
+                err != null -> Text(err!!, color = p.bad)
+                d == null -> Box(Modifier.fillMaxWidth().padding(28.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = p.accent) }
+                else -> {
+                    val used = d.l("context_used"); val max = d.l("context_max")
+                    val pct = d.l("context_percent").toInt()
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text("$pct%", style = MaterialTheme.typography.headlineMedium, color = if (pct >= 85) p.bad else if (pct >= 60) p.warn else p.ink)
+                        Spacer(Modifier.width(10.dp))
+                        Text("${humanTokens(used)} of ${humanTokens(max)} tokens" + if (d.b("context_estimated")) " (estimated)" else "", color = p.muted, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 4.dp))
+                    }
+                    val cats = d.a("categories").objs().filter { it.l("tokens") > 0 }
+                    val total = cats.sumOf { it.l("tokens") }.coerceAtLeast(1)
+                    fun col(o: JsonObject, i: Int) = runCatching { androidx.compose.ui.graphics.Color(android.graphics.Color.parseColor(o.s("color"))) }.getOrElse { listOf(p.accent, p.good, p.warn, p.bad, p.muted)[i % 5] }
+                    // the bar shows the share of the window, each category in its own colour
+                    Row(Modifier.padding(vertical = 12.dp).fillMaxWidth().height(12.dp).clip(RoundedCornerShape(50)).background(p.faint.copy(alpha = 0.18f))) {
+                        cats.forEachIndexed { i, c ->
+                            val w = c.l("tokens").toFloat() / max.coerceAtLeast(total)
+                            if (w > 0f) Box(Modifier.fillMaxHeight().weight(w).background(col(c, i)))
+                        }
+                        val free = (max - total).coerceAtLeast(0).toFloat() / max.coerceAtLeast(total)
+                        if (free > 0f) Spacer(Modifier.weight(free))
+                    }
+                    cats.forEachIndexed { i, c ->
+                        Row(Modifier.padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(10.dp).clip(CircleShape).background(col(c, i))); Spacer(Modifier.width(10.dp))
+                            Text(c.s("label").ifBlank { c.s("id") }, color = p.ink, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                            Text(humanTokens(c.l("tokens")), color = p.muted, style = MaterialTheme.typography.bodySmall, fontFamily = Mono)
+                        }
+                    }
+                    usage?.let { u ->
+                        val bits = listOfNotNull(
+                            u.d("cost_usd").takeIf { it > 0 }?.let { "$" + "%.4f".format(it) + " so far" },
+                            u.d("cache_hit_pct").takeIf { it > 0 }?.let { "%.0f%% cache hits".format(it) },
+                        )
+                        if (bits.isNotEmpty()) Text(bits.joinToString(" · "), color = p.faint, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    SoftButton("Compress now", Icons.Outlined.Compress, Modifier.fillMaxWidth()) {
+                        scope.launch { try { toast(g.compress()); data = g.contextBreakdown() } catch (e: Exception) { toast(errText(e)) } }
+                    }
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+/** File checkpoints Hermes took in this chat's folder: look at a diff, roll back. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CheckpointSheet(onClose: () -> Unit) {
+    val p = LocalPalette.current
+    val g = app.gateway
+    val scope = rememberCoroutineScope()
+    var data by remember { mutableStateOf<JsonObject?>(null) }
+    var err by remember { mutableStateOf<String?>(null) }
+    var openHash by remember { mutableStateOf<String?>(null) }
+    var diff by remember { mutableStateOf<JsonObject?>(null) }
+    var confirm by remember { mutableStateOf<JsonObject?>(null) }
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(tick) { try { data = g.checkpoints(); err = null } catch (e: Exception) { err = errText(e) } }
+    LaunchedEffect(openHash) { diff = null; openHash?.let { h -> diff = runCatching { g.checkpointDiff(h) }.getOrElse { e -> jsonOf("diff" to errText(e)) } } }
+    ModalBottomSheet(onClose, containerColor = p.sheet) {
+        Text("Checkpoints", style = MaterialTheme.typography.titleLarge, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
+        Text("Snapshots of the working folder Hermes took before changing files.", color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 600.dp), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val d = data
+            val cps = d?.a("checkpoints")?.objs().orEmpty()
+            when {
+                err != null -> item { Text(err!!, color = p.bad, modifier = Modifier.padding(8.dp)) }
+                d == null -> item { Box(Modifier.fillMaxWidth().padding(28.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = p.accent) } }
+                !d.b("enabled") -> item { Text("Checkpoints are off on this Hermes. Turn on checkpoints in its config to get them.", color = p.muted, modifier = Modifier.padding(8.dp)) }
+                cps.isEmpty() -> item { Text("No checkpoints yet. Hermes takes one before it edits files.", color = p.muted, modifier = Modifier.padding(8.dp)) }
+            }
+            items(cps, key = { it.s("hash") }) { cp ->
+                val h = cp.s("hash")
+                val isOpen = openHash == h
+                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(p.accentSoft.copy(alpha = 0.45f)).clickable { openHash = if (isOpen) null else h }.padding(14.dp)) {
+                    Text(cp.s("message").ifBlank { "Checkpoint" }, color = p.ink, style = MaterialTheme.typography.bodyMedium, maxLines = if (isOpen) 4 else 1, overflow = TextOverflow.Ellipsis)
+                    Text(listOf(h.take(8), cp.s("timestamp")).filter { it.isNotBlank() }.joinToString(" · "), color = p.faint, fontFamily = Mono, style = MaterialTheme.typography.labelSmall)
+                    AnimatedVisibility(isOpen) {
+                        Column(Modifier.padding(top = 10.dp)) {
+                            val df = diff
+                            if (df == null) CircularProgressIndicator(Modifier.size(18.dp), color = p.accent, strokeWidth = 2.dp)
+                            else {
+                                df.sn("stat")?.takeIf { it.isNotBlank() }?.let { Text(it, color = p.muted, fontFamily = Mono, style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)) }
+                                CodeBlock(df.s("diff").ifBlank { "No changes since this checkpoint." }.take(20000), 260.dp)
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            SoftButton("Restore this checkpoint", Icons.Outlined.Restore, danger = true) { confirm = cp }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+    confirm?.let { cp ->
+        ConfirmDialog("Restore checkpoint?", "Files in the working folder go back to how they were at “${cp.s("message").take(60)}”. The chat rewinds to that point too.", "Restore", danger = true, { confirm = null }) {
+            confirm = null
+            scope.launch {
+                try {
+                    val r = g.restoreCheckpoint(cp.s("hash"))
+                    val n = r.a("restored_files").size
+                    toast(if (n > 0) "Restored $n file${if (n == 1) "" else "s"}" else "Restored")
+                    openHash = null; tick++
+                } catch (e: Exception) { toast(errText(e)) }
+            }
+        }
     }
 }
 
@@ -1063,6 +1367,10 @@ private fun WorkStep(st: ChatItem) {
                         Text(friendlyTool(st.name), color = p.ink, style = MaterialTheme.typography.bodySmall)
                         if (st.preview.isNotBlank()) Text("  " + st.preview.lineSequence().first(), color = p.faint, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         else Spacer(Modifier.weight(1f))
+                        if (st.risk.isNotBlank()) Row(Modifier.padding(end = 6.dp).clip(RoundedCornerShape(50)).background(p.bad.copy(alpha = 0.14f)).padding(horizontal = 6.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Outlined.GppMaybe, "Flagged output", tint = p.bad, modifier = Modifier.size(12.dp)); Spacer(Modifier.width(3.dp))
+                            Text(st.risk, color = p.bad, style = MaterialTheme.typography.labelSmall)
+                        }
                         if (st.duration > 0) Text(String.format("%.1fs", st.duration), color = p.faint, style = MaterialTheme.typography.labelSmall)
                     }
                     AnimatedVisibility(open) {
@@ -1070,6 +1378,8 @@ private fun WorkStep(st: ChatItem) {
                             Text(st.name, color = p.faint, fontFamily = Mono, style = MaterialTheme.typography.labelSmall)
                             if (st.preview.isNotBlank()) CodeBlock(st.preview, 160.dp)
                             if (st.summary.isNotBlank()) Text(st.summary, color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                            if (st.risk.isNotBlank()) Text("Hermes flagged this output as ${st.risk}" + (if (st.findings.isNotEmpty()) ": " + st.findings.joinToString("; ") else "") + ". Treat what it says with care.",
+                                color = p.bad, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
                         }
                     }
                     if (isHelper(st.name)) Row(Modifier.padding(top = 6.dp).clip(RoundedCornerShape(50)).background(p.accentSoft)
