@@ -10,6 +10,7 @@
 <meta property="og:image" content="https://farhan-beg.github.io/talaria/screenshots/chat.jpg">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23130E22'/%3E%3Cpath d='M16 44 C28 42 40 32 46 18' stroke='%23F0C46C' stroke-width='5' stroke-linecap='round' fill='none'/%3E%3Cpath d='M18 51 C30 48 42 39 49 27' stroke='%23F0C46C' stroke-width='5' stroke-linecap='round' fill='none' opacity='0.55'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
 <style>
 @font-face { font-family:"Inter"; src:url("fonts/inter_regular.ttf") format("truetype"); font-weight:400; font-style:normal; font-display:swap; }
 @font-face { font-family:"Inter"; src:url("fonts/inter_medium.ttf") format("truetype"); font-weight:500; font-style:normal; font-display:swap; }
@@ -56,7 +57,7 @@ nav{
 .nav-in{display:flex; align-items:center; gap:26px; height:64px}
 .brand{display:flex; align-items:center; gap:10px; font-weight:600; letter-spacing:-.02em; font-size:17px}
 .brand svg{width:26px; height:26px}
-.nav-links{display:flex; gap:22px; margin-left:auto; font-size:14px; color:var(--muted)}
+.nav-links{display:flex; gap:22px; margin-left:auto; font-size:14px; color:#BCB3CE}
 .nav-links a:hover{color:var(--ink)}
 .nav-cta{display:flex; gap:10px; align-items:center}
 
@@ -69,14 +70,14 @@ nav{
 }
 .btn-gold{background:var(--gold); color:var(--gold-ink); box-shadow:0 6px 24px rgba(240,196,108,.22)}
 .btn-gold:hover{transform:translateY(-2px); box-shadow:0 12px 34px rgba(240,196,108,.30)}
-.btn-ghost{border-color:var(--line-strong); color:var(--ink); background:rgba(28,22,48,.4)}
+.btn-ghost{border-color:rgba(255,244,224,.22); color:var(--ink); background:rgba(28,22,48,.4)}
 .btn-ghost:hover{transform:translateY(-2px); border-color:rgba(240,196,108,.45); background:rgba(42,34,66,.5)}
 .btn small{font-weight:500; opacity:.72}
 
 /* hero */
 .hero{padding:74px 0 40px}
 .hero-grid{display:grid; grid-template-columns:1.12fr .88fr; gap:44px; align-items:center}
-.eyebrow{color:var(--gold); font-size:12.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; margin-bottom:14px}
+.eyebrow{color:var(--gold); font-size:13px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; margin-bottom:14px}
 h1{font-size:clamp(34px,4.6vw,58px); line-height:1.06; letter-spacing:-.035em; font-weight:700}
 h1 .serif{font-family:var(--serif); font-weight:500; letter-spacing:-.01em;
   background:linear-gradient(92deg,#F5F0E8 8%, #F0C46C 62%, #C89B45 100%);
@@ -90,14 +91,14 @@ h1 .serif{font-family:var(--serif); font-weight:500; letter-spacing:-.01em;
 /* phones */
 .hero-visual{position:relative; display:flex; justify-content:center}
 .phone{
-  width:min(285px,74vw); border-radius:38px; padding:9px;
+  width:min(300px,76vw); border-radius:38px; padding:9px;
   background:linear-gradient(180deg, #221A38, #17112A);
   border:1px solid var(--line-strong);
   box-shadow:0 40px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(240,196,108,.06), 0 0 120px rgba(122,82,224,.25);
 }
 .phone img{border-radius:30px; width:100%}
 .phone-hero{animation:float 7s ease-in-out infinite}
-.phone-back{position:absolute; right:-34px; top:44px; width:200px; opacity:.85; transform:rotate(7deg); z-index:-1; display:none}
+.phone-back{position:absolute; right:-10px; top:52px; width:192px; opacity:.82; transform:rotate(6deg); z-index:-1; display:none}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-9px)}}
 
 /* sections */
@@ -174,11 +175,12 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
 .foot-links a:hover{color:var(--ink)}
 .fine{color:var(--faint); font-size:12.5px; margin-top:16px; line-height:1.7}
 
-/* reveal on scroll */
-.rv{opacity:0; transform:translateY(16px); transition:opacity .6s ease, transform .6s ease}
-.rv.in{opacity:1; transform:none}
+/* reveal on scroll (fail-safe: visible unless JS is running) */
+.rv{transition:opacity .6s ease, transform .6s ease}
+.js .rv:not(.in){opacity:0; transform:translateY(16px)}
 @media (prefers-reduced-motion: reduce){
-  .rv{opacity:1; transform:none; transition:none}
+  .js .rv:not(.in){opacity:1; transform:none}
+  .rv{transition:none}
   .phone-hero{animation:none}
   html{scroll-behavior:auto}
 }
@@ -442,6 +444,14 @@ footer{border-top:1px solid var(--line); padding:40px 0 54px; margin-top:30px}
     });
   }, { rootMargin: '0px 0px -8% 0px', threshold: 0.05 });
   els.forEach(function(e){ io.observe(e); });
+  // fail-safe: if the observer is late or misses, reveal anything already in the viewport
+  setTimeout(function(){
+    var vh = window.innerHeight || 800;
+    document.querySelectorAll('.rv:not(.in)').forEach(function(e){
+      var r = e.getBoundingClientRect();
+      if (r.top < vh && r.bottom > 0) e.classList.add('in');
+    });
+  }, 1500);
   // stagger cards slightly for a calmer entrance
   document.querySelectorAll('.grid3 .card, .theme-row .theme, .steps .step').forEach(function(e,i){
     e.style.transitionDelay = (i % 6) * 45 + 'ms';
