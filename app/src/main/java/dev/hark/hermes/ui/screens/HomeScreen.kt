@@ -50,6 +50,7 @@ fun HomeScreen(nav: NavHostController) {
         onRefresh = { status.reload(); sessions.reload(); model.reload(); sys.reload() },
         actions = {
             ServerSwitcher(nav)
+            IconButton({ nav.go("bots") }) { Icon(Icons.Outlined.SmartToy, "Bots", tint = p.ink) }
             IconButton({ nav.go("settings") }) { Icon(Icons.Outlined.AccountCircle, "Settings", tint = p.ink) }
         },
     ) {

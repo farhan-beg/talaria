@@ -28,6 +28,7 @@ private val groups = listOf(
     "Agent" to listOf(
         Dest("models", "Model", "Main and auxiliary models", Icons.Outlined.Memory, 0xFF0F5C58),
         Dest("skills", "Skills & tools", "Toggle, browse the hub", Icons.Outlined.Extension, 0xFF7A5AF8),
+        Dest("bots", "Bots", "Named agents, each with a forever-chat", Icons.Outlined.SmartToy, 0xFF8B5CF6),
         Dest("profiles", "Profiles", "Isolated Hermes instances", Icons.Outlined.People, 0xFF2E7DD7),
         Dest("memory", "Memory", "Providers and built-in stores", Icons.Outlined.Psychology, 0xFFC2410C),
         Dest("files", "Files", "Browse, preview, upload, download", Icons.Outlined.FolderOpen, 0xFFCA8A04),

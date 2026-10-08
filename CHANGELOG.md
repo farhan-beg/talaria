@@ -3,6 +3,17 @@
 All notable changes to Talaria are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.14] - 2026-10-08 (versionCode 31)
+
+### Bots
+- New Bots screen (Home robot icon, or Control center): every profile as a bot with avatar, @handle, the last line of its chat and a green "working" badge; pinned first, then sections; search; hidden toggle; long-press to pin, hide, edit or delete.
+- Forever-chat: tap a bot to open its one "Bot Chat" (resolved server-side by title, the same chat Desktop has), running on that bot's own profile; survives app kills; header shows avatar and name, Rename becomes "All bots".
+- New bot: name, mission, colour, shape and optional SOUL; starts with the main profile's model and keys.
+- Edit bot: name, mission, colour, shape, photo (cropped to 512 px), section and SOUL.md; the look syncs through the same profile metadata Desktop reads, with compare-and-swap so two devices saving at once don't overwrite each other.
+- Teammate messages show as that bot's bubble with its avatar.
+
+Not yet: Desktop's multi-bot group rooms; per-bot cron and screen panes.
+
 ## [1.14.13] - 2026-10-08 (versionCode 30)
 
 - Links in chat open with a single tap: text selection and the bubble's long-press used to swallow the tap. Web links open in your browser or the app that handles them; file paths open in the viewer. Long-press still selects text and opens the menu.

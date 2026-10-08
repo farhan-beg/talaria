@@ -124,7 +124,9 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
     val isActive get() = serverId.isBlank() || serverId == store.activeId.value
     /** The profile this connection talks to; frozen when you switch to another server. */
     @Volatile private var frozenProfile = store.profile.value
-    private fun profileNow() = if (isActive) store.profile.value else frozenProfile
+    private fun profileNow() = botProfile.value ?: if (isActive) store.profile.value else frozenProfile
+    /** Set while a bot's forever-chat is open: that chat runs on the bot's own profile, whatever profile the app manages. */
+    val botProfile = MutableStateFlow<String?>(null)
     fun deactivate() { frozenProfile = store.profile.value }
     fun activate() {}
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -167,7 +169,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             field = v
             if (v.isNotBlank()) runCatching {
                 store.tagSession(v, serverId)
-                if (isActive) store.lastChat = v else store.setLastChat(serverId, frozenProfile, v)
+                if (isActive) { store.lastChat = v; store.lastChatBot = botProfile.value.orEmpty() } else store.setLastChat(serverId, frozenProfile, v)
             }
         }
     private var seq = 0L
@@ -261,7 +263,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 } else if (!wasReconnect && storedSid.isBlank() && items.value.isEmpty() && isActive) {
                     // cold start (process was killed while away): reopen the chat you were in, not a blank one
                     val last = store.lastChat
-                    if (last.isNotBlank()) runCatching { resume(last, store.lastChatTitle.ifBlank { null }) }
+                    if (last.isNotBlank()) runCatching { resume(last, store.lastChatTitle.ifBlank { null }, bot = store.lastChatBot.ifBlank { null }) }
                 }
                 reconnecting.value = false
             }
@@ -913,30 +915,45 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         return r.a("items").objs().map { SlashHint(it.s("text"), it.sn("display") ?: it.s("text"), it.s("meta"), false) }
     }
 
-    suspend fun newChat() {
+    suspend fun newChat() = startChat(bot = null, title = null)
+
+    /** Opens a bot's one forever-chat: resume it when the server knows it, else mint it titled "Bot Chat". */
+    suspend fun openBot(name: String, chatId: String?) {
+        if (chatId != null) resume(chatId, Bots.CHAT_TITLE, bot = name)
+        else startChat(bot = name, title = Bots.CHAT_TITLE)
+    }
+
+    val inBotChat get() = botProfile.value != null
+
+    private suspend fun startChat(bot: String?, title: String?) {
         loadingSession.value = true
         try {
-            items.value = emptyList(); title.value = "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
+            items.value = emptyList(); this.title.value = title ?: "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
+            botProfile.value = bot
             val p = profileNow()
             todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
-            runCatching { if (isActive) store.lastChatTitle = "" }
+            runCatching { if (isActive) store.lastChatTitle = title.orEmpty() }
             fastAssertFor = ""
             // the speed rides on create itself; a config.set before the agent is built would be dropped
             // one key per new chat, so a retry after a lost reply can't mint a second session
             val idem = java.util.UUID.randomUUID().toString()
-            val r = try { rpc("session.create", jsonOf("cols" to 80, "source" to SOURCE, "profile" to p.ifBlank { null }, "fast" to (if (store.fastPref.value) true else null), "idempotency_key" to idem)) }
-                catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", jsonOf("cols" to 80, "source" to SOURCE, "profile" to p.ifBlank { null }, "idempotency_key" to idem)) }
+            fun params(fast: Boolean) = jsonOf("cols" to 80, "source" to SOURCE, "profile" to p.ifBlank { null },
+                "fast" to (if (fast && store.fastPref.value) true else null), "idempotency_key" to idem, "title" to title)
+            val r = try { rpc("session.create", params(true)) }
+                catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", params(false)) }
             storedSid = r.s("stored_session_id")
             store.markMine(storedSid)
             applySnapshot(r)
+            if (title != null) this.title.value = title
             runCatching { loadRunSettings() }
         } finally { loadingSession.value = false }
     }
 
-    suspend fun resume(stored: String, t: String?) {
+    suspend fun resume(stored: String, t: String?, bot: String? = null) {
         loadingSession.value = true
         try {
             items.value = emptyList(); title.value = t?.ifBlank { null } ?: "Chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
+            botProfile.value = bot
             runCatching { if (isActive) store.lastChatTitle = t.orEmpty() }
             todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
             storedSid = stored
@@ -1444,6 +1461,6 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
     suspend fun setReactionsVisible(on: Boolean): Boolean =
         rpc("config.set", jsonOf("key" to "display.message_reactions", "value" to on)).let { r -> (r["value"] as? JsonPrimitive)?.booleanOrNull ?: on }
 
-    fun reset() { disconnect(); runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
+    fun reset() { disconnect(); botProfile.value = null; runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
         todos.value = emptyList(); subagents.value = emptyMap(); control.value = null; asks.value = emptyList() }
 }

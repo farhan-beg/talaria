@@ -194,6 +194,7 @@ private fun Shell() {
             composable("webhooks") { WebhooksScreen(nav) }
             composable("logs") { LogsScreen(nav) }
             composable("profiles") { ProfilesScreen(nav) }
+            composable("bots") { BotsScreen(nav) }
             composable("system") { SystemScreen(nav) }
             composable("memory") { MemoryScreen(nav) }
             composable("files") { FilesScreen(nav) }

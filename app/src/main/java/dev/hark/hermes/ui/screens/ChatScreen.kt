@@ -243,8 +243,16 @@ fun ChatScreen(nav: NavHostController) {
         Spacer(Modifier.height(topInset))
         // slim status strip: title + connection on the left, new chat on the right
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            val botName by g.botProfile.collectAsStateWithLifecycle()
+            val bots by Bots.roster.collectAsStateWithLifecycle()
+            val bot = botName?.let { bots[it] }
+            LaunchedEffect(botName) { if (botName != null && bot == null) runCatching { Bots.list(g) } }
+            if (botName != null) {
+                Box(Modifier.clip(CircleShape).clickable { nav.go("bots") }) { BotAvatar(bot, 36.dp, name = botName.orEmpty()) }
+                Spacer(Modifier.width(10.dp))
+            }
             Column(Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.titleMedium, color = p.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(if (botName != null) bot?.display ?: botName.orEmpty() else title, style = MaterialTheme.typography.titleMedium, color = p.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Dot(when (conn) { Conn.Ready -> p.good; Conn.Connecting -> p.warn; Conn.Failed -> p.bad; else -> p.faint }, pulse = conn == Conn.Connecting)
                     Spacer(Modifier.width(6.dp))
@@ -274,7 +282,8 @@ fun ChatScreen(nav: NavHostController) {
                 DropdownMenu(menu, { menu = false }, containerColor = p.sheet) {
                     val ready = conn == Conn.Ready && g.sessionId.isNotBlank()
                     fun go(f: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) { menu = false; scope.launch { try { f() } catch (e: Exception) { toast(errText(e)) } } }
-                    DropdownMenuItem({ Text("Rename chat") }, { menu = false; renaming = true }, leadingIcon = { Icon(Icons.Outlined.Edit, null) }, enabled = ready)
+                    if (g.inBotChat) DropdownMenuItem({ Text("All bots") }, { menu = false; nav.go("bots") }, leadingIcon = { Icon(Icons.Outlined.SmartToy, null) })
+                    else DropdownMenuItem({ Text("Rename chat") }, { menu = false; renaming = true }, leadingIcon = { Icon(Icons.Outlined.Edit, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Side question (btw)") }, { menu = false; askBtw = true }, leadingIcon = { Icon(Icons.Outlined.QuestionAnswer, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Subagents") }, { menu = false; SubagentSheetState.open.value = true }, leadingIcon = { Icon(Icons.Outlined.AccountTree, null) }, enabled = ready)
                     DropdownMenuItem({ Text("Compress context") }, { go { toast(g.compress()) } }, leadingIcon = { Icon(Icons.Outlined.Compress, null) }, enabled = ready && !busy)
@@ -622,7 +631,7 @@ private fun ChatRow(item: ChatItem, canRegen: Boolean = false, stats: TurnStats?
     val p = LocalPalette.current
     val clip = LocalClipboardManager.current
     when (item) {
-        is ChatItem.User -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        is ChatItem.User -> Bots.teammateMessage(item.text)?.let { (handle, who, body) -> TeammateBubble(handle, who, body) } ?: Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             var open by remember { mutableStateOf(false) }
             val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
             Column(Modifier.padding(start = 48.dp), horizontalAlignment = Alignment.End) {
@@ -1485,5 +1494,23 @@ private fun AgentReactions(reactions: List<Reaction>) {
     if (theirs.isEmpty()) return
     Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         theirs.forEach { r -> Text(r.emoji, fontSize = 15.sp, modifier = Modifier.clip(RoundedCornerShape(50)).background(p.card).border(1.dp, p.line, RoundedCornerShape(50)).padding(horizontal = 7.dp, vertical = 2.dp)) }
+    }
+}
+
+/** A message another bot sent into this Bot Chat ("Message from 🤖 Name (@handle): …"): shown as theirs, not yours. */
+@Composable
+private fun TeammateBubble(handle: String, who: String, body: String) {
+    val p = LocalPalette.current
+    val bots by Bots.roster.collectAsStateWithLifecycle()
+    val bot = bots[handle]
+    Row(Modifier.fillMaxWidth().padding(end = 36.dp), verticalAlignment = Alignment.Top) {
+        BotAvatar(bot, 30.dp, name = handle)
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.entrance().clip(RoundedCornerShape(6.dp, 24.dp, 24.dp, 24.dp))
+            .background(androidx.compose.ui.graphics.Color(Bots.colorOf(bot, handle)).copy(alpha = 0.14f)).padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Text((bot?.display ?: who) + "  @" + handle, style = MaterialTheme.typography.labelMedium, color = androidx.compose.ui.graphics.Color(Bots.colorOf(bot, handle)))
+            Spacer(Modifier.height(4.dp))
+            SelectionContainer { Markdown(body) }
+        }
     }
 }

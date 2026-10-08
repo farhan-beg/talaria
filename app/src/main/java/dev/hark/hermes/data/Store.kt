@@ -225,6 +225,10 @@ class Store(context: Context) {
         val next = (mineSessions.value + id).let { if (it.size > 3000) it.drop(it.size - 3000).toSet() else it }
         prefs.edit().putStringSet("mine_sessions", next).apply(); mineSessions.value = next
     }
+    /** The bot (profile) whose forever-chat that was, or blank for an ordinary chat. */
+    var lastChatBot: String
+        get() = prefs.getString("last_chat_bot:" + _activeId.value + ":" + _profile.value, "") ?: ""
+        set(v) { prefs.edit().putString("last_chat_bot:" + _activeId.value + ":" + _profile.value, v).apply() }
     /** The chat open when the app last went away, per server + profile, so a cold start comes back to it. */
     var lastChat: String
         get() = prefs.getString("last_chat:" + _activeId.value + ":" + _profile.value, "") ?: ""
