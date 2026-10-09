@@ -55,7 +55,7 @@ import java.io.File
 // ── opening files Hermes mentions ────────────────────────────────────────────
 
 /** A file to show: either a path on Hermes' machine (from chat) or one in the Files browser. */
-data class FileReq(val path: String, val managed: Boolean = false, val local: String = "")
+data class FileReq(val path: String, val managed: Boolean = false, val local: String = "", val parent: FileReq? = null)
 
 object FileOpen {
     val request = MutableStateFlow<FileReq?>(null)
@@ -138,7 +138,7 @@ internal fun saveToDownloads(ctx: Context, name: String, bytes: ByteArray, mime:
 @Composable
 fun FileViewerHost() {
     val req by FileOpen.request.collectAsStateWithLifecycle()
-    req?.let { r -> FileViewer(r) { FileOpen.request.value = null } }
+    req?.let { r -> FileViewer(r) { FileOpen.request.value = r.parent } }
 }
 
 @Composable
@@ -152,6 +152,8 @@ private fun FileViewer(req: FileReq, onClose: () -> Unit) {
     LaunchedEffect(req) { try { data = loadFile(req) } catch (e: Exception) { err = errText(e) } }
     val name = data?.third?.ifBlank { null } ?: req.path.substringAfterLast('/')
     val ext = extOf(name)
+    var rawCsv by remember(req) { mutableStateOf(false) }
+    val isCsv = ext == "csv" || ext == "tsv" || data?.second == "text/csv" || ext in WEB_EXT
     Dialog(onClose, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Column(Modifier.fillMaxSize().background(p.bg).statusBarsPadding().navigationBarsPadding()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -167,6 +169,7 @@ private fun FileViewer(req: FileReq, onClose: () -> Unit) {
                     Box {
                         IconButton({ menu = true }) { Icon(Icons.Outlined.MoreVert, "More", tint = p.ink) }
                         DropdownMenu(menu, { menu = false }, containerColor = p.sheet) {
+                            if (isCsv) DropdownMenuItem({ Text(if (rawCsv) "Show preview" else "Show raw text") }, { menu = false; rawCsv = !rawCsv }, leadingIcon = { Icon(if (rawCsv) Icons.Outlined.TableChart else Icons.Outlined.Notes, null) })
                             DropdownMenuItem({ Text("Open with…") }, { menu = false; openWith(ctx, name, d.first, d.second) }, leadingIcon = { Icon(Icons.Outlined.OpenInNew, null) })
                             DropdownMenuItem({ Text("Save to Downloads") }, { menu = false; scope.launch { try { scope.toast(withContext(Dispatchers.IO) { saveToDownloads(ctx, name, d.first, d.second) }) } catch (e: Exception) { toast(errText(e)) } } }, leadingIcon = { Icon(Icons.Outlined.Download, null) })
                             DropdownMenuItem({ Text("Copy path") }, { menu = false; clip.setText(AnnotatedString(req.path)); scope.launch { toast("Path copied") } }, leadingIcon = { Icon(Icons.Outlined.ContentCopy, null) })
@@ -185,16 +188,17 @@ private fun FileViewer(req: FileReq, onClose: () -> Unit) {
                         Text(err!!, color = p.muted, style = MaterialTheme.typography.bodySmall)
                     }
                     d == null -> CircularProgressIndicator(color = p.accent)
+                    !rawCsv && hasRichPreview(name, d.second) -> RichPreview(name, d.first, d.second, req)
                     ext in IMAGE_EXT || d.second.startsWith("image/") -> ZoomImage(d.first)
                     ext == "pdf" || d.second == "application/pdf" -> PdfPages(d.first)
+                    (ext == "csv" || ext == "tsv" || d.second == "text/csv" || d.second == "text/tab-separated-values") && !rawCsv -> {
+                        val txt = remember(d) { String(d.first.copyOf(minOf(d.first.size, 8_000_000)), Charsets.UTF_8) }
+                        CsvTable(txt, if (ext == "tsv" || d.second == "text/tab-separated-values") '\t' else sniffDelimiter(txt))
+                    }
                     ext in TEXT_EXT || d.second.startsWith("text/") || d.second.contains("json") || looksText(d.first) -> {
-                        val txt = remember(d) { String(d.first.copyOf(minOf(d.first.size, 1_500_000)), Charsets.UTF_8) }
-                        if (ext == "md" || ext == "markdown") Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)) { SelectionContainer { Markdown(txt) } }
-                        else SelectionContainer {
-                            Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()).padding(14.dp)) {
-                                Text(txt, fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 18.sp, color = p.ink)
-                            }
-                        }
+                        val txt = remember(d) { String(d.first.copyOf(minOf(d.first.size, 4_000_000)), Charsets.UTF_8) }
+                        if ((ext == "md" || ext == "markdown") && txt.length < 300_000) Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp)) { SelectionContainer { Markdown(txt) } }
+                        else PlainLines(txt)
                     }
                     else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
                         Icon(iconFor(name, false), null, tint = p.accent, modifier = Modifier.size(56.dp))
@@ -219,7 +223,7 @@ private fun looksText(b: ByteArray): Boolean {
 
 @Composable
 private fun ZoomImage(bytes: ByteArray) {
-    val bmp = remember(bytes) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+    val bmp = remember(bytes) { decodeAny(bytes) }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
     val st = rememberTransformableState { z, pan, _ -> scale = (scale * z).coerceIn(1f, 6f); offset = if (scale == 1f) androidx.compose.ui.geometry.Offset.Zero else offset + pan }
@@ -272,21 +276,41 @@ internal fun iconFor(name: String, dir: Boolean): ImageVector = when {
 
 // ── in-chat pieces ───────────────────────────────────────────────────────────
 
-/** Tappable cards for files a reply mentions. */
+/** Tappable cards for files a reply mentions: stacked full width, so every file is visible at a glance. */
 @Composable
 fun FileChips(paths: List<String>) {
     if (paths.isEmpty()) return
     val p = LocalPalette.current
-    Row(Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(Modifier.padding(top = 8.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (paths.size > 1) Text("${paths.size} files", color = p.muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(start = 2.dp, bottom = 2.dp))
         paths.forEach { path ->
             val name = path.substringAfterLast('/')
-            Row(Modifier.clip(RoundedCornerShape(14.dp)).background(p.accentSoft.copy(alpha = 0.7f)).clickable { FileOpen.open(path) }
-                .padding(start = 10.dp, end = 12.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(iconFor(name, false), null, tint = p.accent, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
-                Text(name, color = p.ink, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 200.dp))
+            val folder = path.substringBeforeLast('/', "").substringAfterLast('/')
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.accentSoft.copy(alpha = 0.7f)).clickable { FileOpen.open(path) }
+                .padding(start = 12.dp, end = 10.dp, top = 9.dp, bottom = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(iconFor(name, false), null, tint = p.accent, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(middleEllipsis(name, 38), color = p.ink, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    val kind = kindLabel(name)
+                    Text(listOf(kind, folder).filter { it.isNotBlank() }.joinToString(" · "), color = p.muted, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Icon(Icons.Outlined.ChevronRight, null, tint = p.faint, modifier = Modifier.size(18.dp))
             }
         }
     }
+}
+
+/** Keeps the start and the extension of a long file name: "yc_india_jobs_fr…20261009.csv". */
+internal fun middleEllipsis(name: String, max: Int): String {
+    if (name.length <= max) return name
+    val tail = minOf(14, max / 3)
+    return name.take(max - tail - 1) + "…" + name.takeLast(tail)
+}
+
+private fun kindLabel(name: String): String = when (val e = extOf(name)) {
+    "csv" -> "CSV spreadsheet"; "tsv" -> "TSV spreadsheet"; "xlsx", "xls" -> "Spreadsheet"; "pdf" -> "PDF"
+    "md", "markdown" -> "Markdown"; "json", "jsonl" -> "JSON"; "zip", "tar", "gz", "tgz", "7z", "rar" -> "Archive"
+    in IMAGE_EXT -> "Image"; "" -> "File"; else -> e.uppercase()
 }
 
 /** An image in a reply: a web URL or a file on Hermes' machine. Tap to open full screen. */
@@ -456,5 +480,143 @@ fun SentAttachments(files: List<Attachment>) {
                 }
             }
         }
+    }
+}
+
+
+// ── big text and tables ─────────────────────────────────────────────────────
+
+/** Plain text, one lazy line at a time, so a 50k-line log never blows past Compose's layout size limit. */
+@Composable
+private fun PlainLines(txt: String) {
+    val p = LocalPalette.current
+    val lines = remember(txt) { txt.lines() }
+    val gutter = remember(lines) { lines.size.toString().length }
+    Box(Modifier.fillMaxSize().horizontalScroll(rememberScrollState())) {
+        SelectionContainer {
+            androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxHeight(), contentPadding = PaddingValues(14.dp)) {
+                items(lines.size) { i ->
+                    Row {
+                        Text((i + 1).toString().padStart(gutter), fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 18.sp, color = p.faint, softWrap = false)
+                        Spacer(Modifier.width(12.dp))
+                        Text(lines[i].ifEmpty { " " }, fontFamily = Mono, fontSize = 12.5.sp, lineHeight = 18.sp, color = p.ink, softWrap = false)
+                    }
+                }
+            }
+        }
+    }
+}
+
+internal fun sniffDelimiter(txt: String): Char {
+    val head = txt.lineSequence().take(5).joinToString("\n")
+    return listOf(',', ';', '\t', '|').maxBy { c -> head.count { it == c } }
+}
+
+/** RFC 4180 parsing: quoted fields, doubled quotes, newlines inside quotes. */
+internal fun parseCsv(txt: String, delim: Char, maxRows: Int = 20_000): List<List<String>> {
+    val rows = ArrayList<List<String>>(); var row = ArrayList<String>(); val cell = StringBuilder()
+    var q = false; var i = 0; val src = txt.removePrefix("\uFEFF")
+    while (i < src.length && rows.size < maxRows) {
+        val c = src[i]
+        if (q) {
+            if (c == '"') { if (i + 1 < src.length && src[i + 1] == '"') { cell.append('"'); i++ } else q = false } else cell.append(c)
+        } else when (c) {
+            '"' -> q = true
+            delim -> { row.add(cell.toString()); cell.setLength(0) }
+            '\r' -> {}
+            '\n' -> { row.add(cell.toString()); cell.setLength(0); rows.add(row); row = ArrayList() }
+            else -> cell.append(c)
+        }
+        i++
+    }
+    if (rows.size < maxRows && (cell.isNotEmpty() || row.isNotEmpty())) { row.add(cell.toString()); rows.add(row) }
+    return rows.filterNot { it.size == 1 && it[0].isBlank() }
+}
+
+/** A spreadsheet view: sticky header, row numbers, sized columns, search, and tap a row to read it whole. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CsvTable(txt: String, delim: Char) {
+    val p = LocalPalette.current
+    val rows by produceState<List<List<String>>?>(null, txt, delim) { value = withContext(Dispatchers.Default) { parseCsv(txt, delim) } }
+    TableView(rows ?: run { CircularProgressIndicator(color = p.accent); return })
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun TableView(all: List<List<String>>) {
+    val p = LocalPalette.current
+    if (all.isEmpty()) { Text("This file is empty", color = p.muted); return }
+    val header = all.first(); val body = all.drop(1)
+    val cols = maxOf(header.size, body.maxOfOrNull { it.size } ?: 0)
+    val widths = remember(all) {
+        (0 until cols).map { c ->
+            val longest = (listOf(header) + body.take(300)).maxOf { (it.getOrNull(c) ?: "").length }
+            (longest * 7.5f + 24f).coerceIn(72f, 260f).dp
+        }
+    }
+    var query by rememberSaveable { mutableStateOf("") }
+    val shown = remember(body, query) { if (query.isBlank()) body.indices.toList() else body.indices.filter { r -> body[r].any { it.contains(query, true) } } }
+    var open by remember { mutableStateOf<Int?>(null) }
+    val hs = rememberScrollState()
+    val numW = (body.size.toString().length * 9 + 20).dp
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f)) { SearchField(query, { query = it }, "Search ${body.size} rows") }
+        }
+        Text(if (query.isBlank()) "${body.size} rows · $cols columns" + (if (body.size >= 19_999) " (first 20,000 shown)" else "") else "${shown.size} of ${body.size} rows match",
+            color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(start = 16.dp, bottom = 6.dp))
+        HorizontalDivider(color = p.line)
+        androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
+            stickyHeader {
+                Row(Modifier.background(p.card).horizontalScroll(hs)) {
+                    Text("#", color = p.faint, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(numW).padding(horizontal = 8.dp, vertical = 10.dp))
+                    (0 until cols).forEach { c ->
+                        Text(header.getOrNull(c).orEmpty(), color = p.ink, style = MaterialTheme.typography.labelLarge, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.width(widths[c]).padding(horizontal = 8.dp, vertical = 10.dp))
+                    }
+                }
+                HorizontalDivider(color = p.line)
+            }
+            items(shown.size) { k ->
+                val r = shown[k]; val row = body[r]
+                Row(Modifier.fillMaxWidth().background(if (k % 2 == 1) p.card.copy(alpha = 0.35f) else androidx.compose.ui.graphics.Color.Transparent)
+                    .clickable { open = r }.horizontalScroll(hs)) {
+                    Text((r + 1).toString(), color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(numW).padding(horizontal = 8.dp, vertical = 9.dp))
+                    (0 until cols).forEach { c ->
+                        Text(row.getOrNull(c).orEmpty(), color = p.ink, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.width(widths[c]).padding(horizontal = 8.dp, vertical = 9.dp))
+                    }
+                }
+            }
+        }
+    }
+    open?.let { r ->
+        val row = body[r]
+        val uri = androidx.compose.ui.platform.LocalUriHandler.current
+        AlertDialog(onDismissRequest = { open = null }, containerColor = p.sheet, shape = RoundedCornerShape(26.dp),
+            title = { Text("Row ${r + 1}") },
+            text = {
+                SelectionContainer {
+                    Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        (0 until cols).forEach { c ->
+                            val v = row.getOrNull(c).orEmpty()
+                            Column {
+                                Text(header.getOrNull(c).orEmpty().ifBlank { "Column ${c + 1}" }, color = p.muted, style = MaterialTheme.typography.labelMedium)
+                                val link = v.startsWith("http://") || v.startsWith("https://")
+                                Text(v.ifBlank { "—" }, color = if (link) p.accent else p.ink, style = MaterialTheme.typography.bodyMedium,
+                                    modifier = if (link) Modifier.clickable { runCatching { uri.openUri(v.trim()) } } else Modifier)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton({ open = null }) { Text("Done", color = p.accent) } },
+            dismissButton = {
+                Row {
+                    TextButton({ if (r > 0) open = r - 1 }, enabled = r > 0) { Text("Prev", color = p.muted) }
+                    TextButton({ if (r < body.size - 1) open = r + 1 }, enabled = r < body.size - 1) { Text("Next", color = p.muted) }
+                }
+            })
     }
 }
