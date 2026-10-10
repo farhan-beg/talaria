@@ -61,6 +61,7 @@ class HermesApp : Application() {
         super.onCreate()
         instance = this
         store = Store(this)
+        dev.hark.hermes.data.Diag.init(this, store.verboseLog.value)
         api = Api(store)
         auth = NativeAuth(api, store)
         TurnService.ensureChannels(this)

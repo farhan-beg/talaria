@@ -188,9 +188,37 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         val cm = ctx.getSystemService(android.net.ConnectivityManager::class.java) ?: return
         runCatching {
             cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: android.net.Network) { if (wanted && conn.value != Conn.Ready) reconnectNow() }
-                override fun onLost(network: android.net.Network) { if (wanted) ws?.cancel() }
+                override fun onAvailable(network: android.net.Network) {
+                    val prev = currentNet; currentNet = network
+                    Diag.i("net", "Default network now $network (${Diag.networkSummary(ctx)})${if (prev != null && prev != network) ", was $prev" else ""}")
+                    if (!wanted) return
+                    if (conn.value != Conn.Ready) reconnectNow() else if (prev != null && prev != network) probe("network switched", 600)
+                }
+                override fun onLost(network: android.net.Network) {
+                    // VPNs like Tailscale swap the default network often, and the old network's onLost can land
+                    // after the new one's onAvailable. Killing the socket on that stale event is what dropped a
+                    // freshly reconnected chat half a second later. Only react to the network we're on, and even
+                    // then check the socket instead of assuming it's dead (TCP often survives the swap).
+                    if (network != currentNet) { Diag.d("net", "Ignored onLost for old network $network"); return }
+                    currentNet = null
+                    Diag.w("net", "Default network lost ($network)")
+                    if (wanted) probe("network lost", 2_000)
+                }
             })
+        }
+    }
+
+    @Volatile private var currentNet: android.net.Network? = null
+    private var netProbe: Job? = null
+
+    /** After a network event: ping the socket and only reconnect when it really stopped answering. */
+    private fun probe(why: String, afterMs: Long) {
+        netProbe?.cancel()
+        netProbe = scope.launch {
+            delay(afterMs)
+            if (!wanted || conn.value != Conn.Ready) return@launch
+            val ok = runCatching { withTimeout(6_000) { rpcRaw("ping", JsonObject(emptyMap())) } }.isSuccess
+            if (ok) Diag.i("net", "Chat link survived ($why)") else { Diag.w("net", "Chat link dead after $why; reconnecting"); ws?.cancel() }
         }
     }
 
@@ -200,16 +228,66 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         if (conn.value != Conn.Ready) { reconnectNow(); return }
         scope.launch {
             val ok = runCatching { withTimeout(5_000) { rpcRaw("ping", JsonObject(emptyMap())) } }.isSuccess
-            if (!ok) { ws?.cancel() }
+            if (!ok) { Diag.w("ws", "Socket dead after resume (ping timed out); reconnecting"); ws?.cancel() }
         }
     }
 
-    private fun reconnectNow() { retryJob?.cancel(); attempt = 0; conn.value = Conn.Idle; connect() }
+    /** "Tap to reconnect": a fresh start, including another go at refreshing the sign-in. */
+    fun retry() {
+        Diag.i("ws", "Manual reconnect")
+        authRecoveries = 0; retryJob?.cancel(); attempt = 0
+        if (conn.value != Conn.Ready) { conn.value = Conn.Idle; connect() }
+    }
+
+    @Volatile private var authRecoveries = 0
+
+    /**
+     * The server turned the chat socket away (HTTP 401/403 on the upgrade, or close 4401/4403). Before 1.14.16 this
+     * was final and "Tap to reconnect" re-sent the same dead token, so it failed again within half a second. Now:
+     * ask the REST side whether the token is still good, refresh it when it isn't, and only then give up.
+     */
+    private fun authRejected(what: String) {
+        Diag.w("ws", "Chat socket rejected: $what")
+        dropped(null)
+        retryJob?.cancel()
+        if (!wanted) return
+        conn.value = Conn.Connecting; reconnecting.value = true
+        val n = ++authRecoveries
+        retryJob = scope.launch {
+            val stale = api.accessTokenFor(serverId)
+            val st = api.authStatusFor(serverId, stale)
+            Diag.i("auth", "Session check after rejection #$n: HTTP $st")
+            when {
+                st == 401 -> if (n <= 2 && api.forceRefreshFor(serverId, stale)) { Diag.i("ws", "Reconnecting with a refreshed token"); conn.value = Conn.Idle; connect() } else authFailed("refresh after socket rejection failed ($what)")
+                st in 200..299 -> if (n <= 2) { delay(400L * n); conn.value = Conn.Idle; connect() } else refused(what)
+                else -> { reconnecting.value = true; scheduleRetry() }   // can't tell yet (server unreachable): keep trying quietly
+            }
+        }
+    }
+
+    private fun authFailed(reason: String) {
+        conn.value = Conn.Failed; connError.value = AUTH_ERR; reconnecting.value = false
+        if (!readyGate.isCompleted) readyGate.completeExceptionally(java.io.IOException(AUTH_ERR))
+        if (serverId.isBlank() || serverId == store.activeId.value) api.signalExpired(reason) else Diag.e("auth", "Session expired on ${store.serverLabel(serverId)}: $reason")
+    }
+
+    private fun refused(what: String) {
+        Diag.e("ws", "Signed in, but the server keeps refusing the chat socket ($what). Likely dashboard.public_url / Host mismatch behind a proxy or Tailscale Serve, or embedded chat disabled.")
+        conn.value = Conn.Failed; reconnecting.value = false
+        connError.value = "Hermes refused the chat link"
+    }
+
+    private fun reconnectNow() {
+        // an attempt already in flight (not just waiting out a backoff): don't start a second socket beside it
+        if (conn.value == Conn.Connecting && retryJob?.isActive != true) return
+        retryJob?.cancel(); attempt = 0; conn.value = Conn.Idle; connect()
+    }
 
     private fun scheduleRetry() {
         retryJob?.cancel()
         val delayMs = (500L shl attempt.coerceAtMost(5)).coerceAtMost(15_000L)
         attempt++
+        Diag.i("ws", "Retry #$attempt in ${delayMs} ms")
         reconnecting.value = true
         retryJob = scope.launch { delay(delayMs); if (wanted && conn.value != Conn.Ready) { conn.value = Conn.Idle; connect() } }
     }
@@ -221,8 +299,15 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         connError.value = null
         readyGate = CompletableDeferred()
         scope.launch {
-            val token = try { api.accessTokenFor(serverId) } catch (e: Exception) { "" }
-            val req = Request.Builder().url(api.wsUrlFor(serverId, "/api/ws", token)).build()
+            val needsAuth = store.serverAuth(serverId)?.authRequired != false
+            val url = if (needsAuth) {
+                val t = api.wsTicketFor(serverId)
+                if (t.authDead) { if (wanted) authFailed("token refresh failed while opening chat") else conn.value = Conn.Idle; return@launch }
+                if (t.ticket != null) api.wsTicketUrlFor(serverId, "/api/ws", t.ticket)
+                else api.wsUrlFor(serverId, "/api/ws", try { api.accessTokenFor(serverId) } catch (e: Exception) { "" })
+            } else api.wsUrlFor(serverId, "/api/ws", try { api.accessTokenFor(serverId) } catch (e: Exception) { "" })
+            Diag.i("ws", "Connecting to ${store.serverAuth(serverId)?.host ?: "?"} (${if (url.contains("ticket=")) "ticket" else if (url.contains("token=")) "token" else "no auth"})")
+            val req = Request.Builder().url(url).build()
             val gen = ++connGen
             if (!wanted) return@launch
             ws?.let { old -> ws = null; old.cancel() }   // its callbacks are now stale and ignored
@@ -248,6 +333,8 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             ws = webSocket
             val wasReconnect = reconnecting.value || attempt > 0 || everOpened
             everOpened = true
+            authRecoveries = 0
+            Diag.i("ws", "Connected${if (wasReconnect) " (reconnect)" else ""}")
             conn.value = Conn.Ready
             connError.value = null
             attempt = 0
@@ -288,17 +375,24 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             }
         }
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (stale(webSocket)) return; dropped(if (code == 4401) "Sign-in expired" else null) }
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (stale(webSocket)) return
+            Diag.w("ws", "Closed by server: $code ${reason.take(120)}")
+            if (code == 4401 || code == 4403) authRejected("close $code ${reason.take(80)}") else dropped(null)
+        }
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (stale(webSocket)) return
-            dropped(if (response?.code == 401 || response?.code == 403) "Sign-in expired" else (t.message ?: "Connection lost"))
+            val rc = response?.code
+            Diag.w("ws", "Socket failed: ${if (rc != null) "HTTP $rc · " else ""}${t.javaClass.simpleName}: ${t.message}")
+            if (rc == 401 || rc == 403) authRejected("HTTP $rc on upgrade") else dropped(t.message ?: "Connection lost")
         }
     }
 
     private fun dropped(err: String?) {
         if (ws == null && conn.value == Conn.Idle) return
         ws = null
-        val auth = err == "Sign-in expired"
+        if (err != null) Diag.w("ws", "Dropped: $err")
+        val auth = err == AUTH_ERR
         // transient drops retry quietly; only auth failures or a long outage surface as an error
         if (wanted && !auth && attempt < 8) {
             conn.value = Conn.Connecting
@@ -1464,3 +1558,5 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
     fun reset() { disconnect(); botProfile.value = null; runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
         todos.value = emptyList(); subagents.value = emptyMap(); control.value = null; asks.value = emptyList() }
 }
+
+private const val AUTH_ERR = "Sign-in expired"

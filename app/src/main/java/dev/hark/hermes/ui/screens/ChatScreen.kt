@@ -299,11 +299,15 @@ fun ChatScreen(nav: NavHostController) {
         }
         if (conn == Conn.Failed || conn == Conn.Idle) {
             Row(Modifier.padding(horizontal = 18.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(p.bad.copy(alpha = 0.1f)).clickable {
-                g.connect()
+                g.retry()
                 if (g.storedSid.isNotBlank()) scope.launch { runCatching { g.resume(g.storedSid, title) } }
-            }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            }.padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Outlined.CloudOff, null, tint = p.bad, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
-                Text("Not connected. Tap to reconnect.", color = p.ink, style = MaterialTheme.typography.bodyMedium)
+                Column(Modifier.weight(1f)) {
+                    Text("Not connected. Tap to reconnect.", color = p.ink, style = MaterialTheme.typography.bodyMedium)
+                    connErr?.let { Text(it, color = p.muted, style = MaterialTheme.typography.bodySmall) }
+                }
+                TextButton({ nav.go("report/connection") }) { Text("Report", color = p.bad) }
             }
         }
 

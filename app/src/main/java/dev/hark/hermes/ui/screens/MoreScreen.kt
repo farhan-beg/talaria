@@ -50,6 +50,10 @@ private val groups = listOf(
         Dest("system", "System", "Host, gateway, operations", Icons.Outlined.Dns, 0xFF0F766E),
         Dest("settings", "App settings", "Theme, profile, account", Icons.Outlined.Settings, 0xFF6B7280),
     ),
+    "Help" to listOf(
+        Dest("report", "Report a problem", "Send it to the developer", Icons.Outlined.BugReport, 0xFFDC2626),
+        Dest("applog", "App diagnostics", "This phone's connection log", Icons.Outlined.MonitorHeart, 0xFF0891B2),
+    ),
 )
 
 @Composable
@@ -178,9 +182,9 @@ fun SettingsScreen(nav: NavHostController) {
                 ListRow("Add server", "Connect another Hermes dashboard", Icons.Outlined.Add, onClick = { app.store.addServer() })
             }
         }
-        item { Text("Talaria 1.14.0  ·  for Hermes Agent", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) }
+        item { Text("Talaria ${dev.hark.hermes.BuildConfig.VERSION_NAME}  ·  for Hermes Agent", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) }
     }
-    if (signOut) ConfirmDialog("Sign out?", "You'll need to sign in with your dashboard OAuth again.", "Sign out", danger = true, { signOut = false }) {
+    if (signOut) ConfirmDialog("Sign out?", "You'll need to sign in to your dashboard again.", "Sign out", danger = true, { signOut = false }) {
         app.dropGateway(app.store.activeId.value); app.store.signOut()
     }
 }

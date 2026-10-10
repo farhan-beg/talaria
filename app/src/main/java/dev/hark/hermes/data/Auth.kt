@@ -35,10 +35,12 @@ class NativeAuth(private val api: Api, private val store: Store) {
         val body = buildJsonObject {
             put("provider", provider); put("username", username); put("password", password); put("next", "/")
         }.toString().toRequestBody(json)
+        Diag.i("auth", "Signing in to ${base.substringAfter("://")} with provider $provider")
         val req = Request.Builder().url("$base/auth/password-login").post(body).build()
         var at = ""; var rt = ""
         api.http.newCall(req).execute().use { r ->
             val txt = r.body?.string().orEmpty()
+            if (!r.isSuccessful) Diag.w("auth", "Sign-in failed: HTTP ${r.code} ${Api.errorDetail(txt) ?: ""}")
             if (!r.isSuccessful) throw java.io.IOException(
                 when (r.code) {
                     401 -> "Wrong username or password."
@@ -65,6 +67,7 @@ class NativeAuth(private val api: Api, private val store: Store) {
             if (!r.isSuccessful) throw java.io.IOException("Server rejected the session (${r.code}): ${Api.errorDetail(txt) ?: txt.take(120)}")
             Jsonx.parseToJsonElement(txt).jsonObject
         }
+        Diag.i("auth", "Signed in as ${me["user_id"]?.jsonPrimitive?.contentOrNull ?: username} via ${me["provider"]?.jsonPrimitive?.contentOrNull ?: provider}; token expires_at=${me["expires_at"]}; refresh token ${if (rt.isNotBlank()) "present" else "MISSING"}")
         store.update {
             it.copy(
                 baseUrl = base, accessToken = at, refreshToken = rt,

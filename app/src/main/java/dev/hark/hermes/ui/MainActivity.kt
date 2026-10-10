@@ -138,6 +138,7 @@ private fun Shell() {
     val scope = rememberCoroutineScope()
     var expired by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { app.api.expired.collect { expired = true } }
+    var lastCrash by remember { mutableStateOf(dev.hark.hermes.data.Diag.takeLastCrash()) }
     val entry by nav.currentBackStackEntryAsState()
     val route = entry?.destination?.route ?: "tabs"
     val onTab = route == "tabs"
@@ -199,6 +200,9 @@ private fun Shell() {
             composable("memory") { MemoryScreen(nav) }
             composable("files") { FilesScreen(nav) }
             composable("settings") { SettingsScreen(nav) }
+            composable("report") { ReportScreen(nav) }
+            composable("report/{kind}") { ReportScreen(nav, it.arguments?.getString("kind").orEmpty()) }
+            composable("applog") { AppLogScreen(nav) }
         }
         AnimatedVisibility(onTab, Modifier.align(Alignment.TopCenter), enter = fadeIn() + slideInVertically { -it / 2 }, exit = fadeOut() + slideOutVertically { -it / 2 }) {
             // continuous position: 1.4 means 40% of the way from Chat to Tasks
@@ -206,11 +210,22 @@ private fun Shell() {
         }
     }
 
+    lastCrash?.let { c ->
+        AlertDialog(
+            onDismissRequest = { lastCrash = null }, containerColor = p.sheet, shape = RoundedCornerShape(26.dp),
+            icon = { Icon(Icons.Outlined.BugReport, null, tint = p.bad) },
+            title = { Text("Talaria closed unexpectedly") },
+            text = { Text("Send the crash details to the developer? You can see everything before it goes.", color = p.muted) },
+            confirmButton = { TextButton({ CrashBus.pending = c; lastCrash = null; nav.go("report/crash") }) { Text("Report it", color = p.accent) } },
+            dismissButton = { TextButton({ lastCrash = null }) { Text("Not now", color = p.muted) } },
+        )
+    }
+
     if (expired) {
         AlertDialog(
             onDismissRequest = {}, containerColor = p.sheet, shape = RoundedCornerShape(26.dp),
             title = { Text("Session expired") },
-            text = { Text("Your dashboard sign-in ran out. Sign in again to keep going.\n\n" + (app.api.lastAuthError ?: ""), color = p.muted) },
+            text = { Text("Your dashboard sign-in ran out and couldn't be renewed. Sign in again to keep going.\n\n" + (app.api.lastAuthError ?: ""), color = p.muted) },
             confirmButton = {
                 TextButton({
                     expired = false; app.dropGateway(app.store.activeId.value); app.store.signOut()

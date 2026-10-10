@@ -13,8 +13,15 @@ android {
         applicationId = "dev.hark.hermes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 32
-        versionName = "1.14.15"
+        versionCode = 33
+        versionName = "1.14.16"
+        // Problem reports: the inbox they go to, an optional HTTPS form endpoint that emails you directly
+        // (Formspree, or Web3Forms with ?access_key=...), and the repo for "Open a GitHub issue".
+        val reportEmail = (project.findProperty("talaria.reportEmail") as String?) ?: System.getenv("TALARIA_REPORT_EMAIL") ?: "farhanbeg3012@gmail.com"
+        val reportUrl = (project.findProperty("talaria.reportUrl") as String?) ?: System.getenv("TALARIA_REPORT_URL") ?: ""
+        buildConfigField("String", "REPORT_EMAIL", "\"$reportEmail\"")
+        buildConfigField("String", "REPORT_URL", "\"$reportUrl\"")
+        buildConfigField("String", "REPORT_REPO", "\"farhan-beg/talaria\"")
     }
     signingConfigs {
         create("release") {
@@ -38,7 +45,7 @@ android {
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
 }
 dependencies {

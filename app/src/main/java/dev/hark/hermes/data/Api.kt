@@ -34,6 +34,8 @@ class Api(private val store: Store) {
     private val _expired = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val expired: SharedFlow<Unit> = _expired
     @Volatile var lastAuthError: String? = null
+    /** Shows the "Session expired" dialog for the active server (the chat socket uses this when its refresh fails). */
+    fun signalExpired(reason: String) { lastAuthError = reason; Diag.e("auth", "Session expired: $reason"); _expired.tryEmit(Unit) }
 
     val base get() = store.auth.value.baseUrl.trimEnd('/')
 
@@ -75,7 +77,8 @@ class Api(private val store: Store) {
                 val body = jsonOf("refresh_token" to a.refreshToken, "provider" to a.provider).toString().toRequestBody(JSONT)
                 val req = Request.Builder().url("$base/auth/native/refresh").post(body).build()
                 http.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) return@withContext false
+                    if (!r.isSuccessful) { Diag.w("auth", "Token refresh rejected: HTTP ${r.code} ${errorDetail(r.body?.string().orEmpty()) ?: ""}"); return@withContext false }
+                    Diag.i("auth", "Access token refreshed")
                     val o = Jsonx.parseToJsonElement(r.body!!.string()).jsonObject
                     store.update {
                         it.copy(
@@ -86,7 +89,7 @@ class Api(private val store: Store) {
                     }
                     true
                 }
-            } catch (e: Exception) { false }
+            } catch (e: Exception) { Diag.e("auth", "Token refresh failed", e); false }
         }
     }
 
@@ -118,16 +121,24 @@ class Api(private val store: Store) {
                     if (token.isNotBlank()) header("Authorization", "Bearer $token")
                     header("Accept", "application/json")
                 }.build()
-                val resp = http.newCall(req).execute()
+                val resp = try { http.newCall(req).execute() } catch (e: IOException) {
+                    Diag.w("http", "$method ${path.substringBefore('?')} failed: ${e.javaClass.simpleName}: ${e.message}"); throw e
+                }
                 resp.use { r ->
                     val txt = r.body?.string().orEmpty()
+                    Diag.d("http", "$method ${path.substringBefore('?')} → ${r.code}")
                     if (r.code == 401 && store.auth.value.authRequired) {
+                        Diag.w("auth", "$method ${path.substringBefore('?')} → 401${if (attempt == 0) ", refreshing" else ""}")
                         if (attempt == 0 && refresh(token)) { token = store.auth.value.accessToken; attempt++; return@use null }
                         lastAuthError = "$path → 401 ${errorDetail(txt) ?: ""}".trim()
+                        Diag.e("auth", "Session expired: $lastAuthError")
                         _expired.tryEmit(Unit)
                         throw AuthExpired()
                     }
-                    if (!r.isSuccessful) throw ApiException(r.code, errorDetail(txt) ?: "Request failed (${r.code})")
+                    if (!r.isSuccessful) {
+                        Diag.w("http", "$method ${path.substringBefore('?')} → ${r.code} ${(errorDetail(txt) ?: "").take(200)}".trim())
+                        throw ApiException(r.code, errorDetail(txt) ?: "Request failed (${r.code})")
+                    }
                     if (txt.isBlank()) JsonObject(emptyMap()) else try { Jsonx.parseToJsonElement(txt) } catch (e: Exception) { JsonPrimitive(txt) }
                 }?.let { return@withContext it }
             }
@@ -186,14 +197,68 @@ class Api(private val store: Store) {
                 val body = jsonOf("refresh_token" to a.refreshToken, "provider" to a.provider).toString().toRequestBody(JSONT)
                 val req = Request.Builder().url(a.baseUrl.trimEnd('/') + "/auth/native/refresh").post(body).build()
                 http.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) return@withContext false
+                    if (!r.isSuccessful) { Diag.w("auth", "Token refresh for ${a.host} rejected: HTTP ${r.code}"); return@withContext false }
+                    Diag.i("auth", "Access token refreshed for ${a.host}")
                     val o = Jsonx.parseToJsonElement(r.body!!.string()).jsonObject
                     store.updateServer(server) { it.copy(accessToken = o.s("access_token"), refreshToken = o.sn("refresh_token") ?: it.refreshToken, expiresAt = o.d("expires_at")) }
                     true
                 }
-            } catch (e: Exception) { false }
+            } catch (e: Exception) { Diag.e("auth", "Token refresh for ${a.host} failed", e); false }
         }
     }
+
+    /** Rotates a server's tokens now, whatever the stored expiry says (clock skew, a server restart, a revoked session). */
+    suspend fun forceRefreshFor(server: String, staleToken: String): Boolean {
+        if (server.isBlank() || server == store.activeId.value) return refresh(staleToken)
+        val a = store.serverAuth(server) ?: return false
+        if (a.accessToken != staleToken && a.accessToken.isNotBlank()) return true
+        return refreshServer(server, a)
+    }
+
+    private fun baseFor(server: String) = (if (server.isBlank() || server == store.activeId.value) base else store.serverAuth(server)?.baseUrl.orEmpty()).trimEnd('/')
+
+    /** HTTP status of /api/auth/me with this token: 200 fine, 401 dead token, -1 unreachable. */
+    suspend fun authStatusFor(server: String, token: String): Int = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder().url(baseFor(server) + "/api/auth/me").apply { if (token.isNotBlank()) header("Authorization", "Bearer $token") }.get().build()
+            http.newCall(req).execute().use { it.code }
+        } catch (e: Exception) { Diag.w("auth", "auth check failed: ${e.javaClass.simpleName}: ${e.message}"); -1 }
+    }
+
+    class TicketResult(val ticket: String?, val authDead: Boolean = false)
+
+    /**
+     * A single-use 30 s chat-socket ticket, minted over REST where an expired token is refreshed and retried, the
+     * same way the dashboard and Desktop open their socket. Older servers without the endpoint fall back to ?token=.
+     */
+    suspend fun wsTicketFor(server: String): TicketResult = withContext(Dispatchers.IO) {
+        var token = accessTokenFor(server)
+        repeat(2) { attempt ->
+            val req = Request.Builder().url(baseFor(server) + "/api/auth/ws-ticket").post("{}".toRequestBody(JSONT))
+                .apply { if (token.isNotBlank()) header("Authorization", "Bearer $token") }.build()
+            val code = try {
+                http.newCall(req).execute().use { r ->
+                    val txt = r.body?.string().orEmpty()
+                    if (r.isSuccessful) {
+                        val t = runCatching { Jsonx.parseToJsonElement(txt).jsonObject.s("ticket") }.getOrDefault("")
+                        if (t.isNotBlank()) { Diag.d("ws", "Minted socket ticket"); return@withContext TicketResult(t) }
+                    }
+                    if (r.code != 401) Diag.w("ws", "ws-ticket answered HTTP ${r.code} ${errorDetail(txt) ?: ""}".trim())
+                    r.code
+                }
+            } catch (e: Exception) { Diag.w("ws", "ws-ticket request failed: ${e.javaClass.simpleName}: ${e.message}"); return@withContext TicketResult(null) }
+            if (code == 401) {
+                Diag.w("auth", "Access token rejected (401) while opening chat; refreshing")
+                if (attempt == 0 && forceRefreshFor(server, token)) { token = accessTokenFor(server); return@repeat }
+                return@withContext TicketResult(null, authDead = true)
+            }
+            return@withContext TicketResult(null)
+        }
+        TicketResult(null)
+    }
+
+    fun wsTicketUrlFor(server: String, path: String, ticket: String): String =
+        baseFor(server).replaceFirst("https://", "wss://").replaceFirst("http://", "ws://") + path + "?ticket=" + enc(ticket)
 
     fun wsUrlFor(server: String, path: String, token: String): String {
         if (server.isBlank() || server == store.activeId.value) return wsUrl(path, token)

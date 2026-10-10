@@ -205,6 +205,10 @@ class Store(context: Context) {
     /** On by default: `hermes chat -q` runs Hermes starts itself (source cli) count as background work. */
     val hideCli = flag("hide_cli_sessions", true)
     val nerd = flag("nerd_stats", false)
+    /** App diagnostics: record every request, not just failures. */
+    val verboseLog = flag("verbose_log", false)
+    /** Reply-to you gave on your last problem report. */
+    val reportContact = str("report_contact", "")
     /** Your fast-mode choice, re-applied to each chat (the server scopes it per session). */
     val fastPref = flag("fast_pref", false)
     /** Voice mode reads replies with the TTS voice configured on Hermes instead of the phone's engine. */
