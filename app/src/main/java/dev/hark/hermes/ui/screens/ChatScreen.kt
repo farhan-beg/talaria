@@ -214,8 +214,9 @@ fun ChatScreen(nav: NavHostController) {
             }
         }
     }
-    val keepInterim by app.store.interimInReply.collectAsStateWithLifecycle()
-    val rows = remember(items, busy, keepInterim) { foldTurns(items, busy, keepInterim) }
+    val notesMode by app.store.workNotes.collectAsStateWithLifecycle()
+    val openLive by app.store.workOpenLive.collectAsStateWithLifecycle()
+    val rows = remember(items, busy, notesMode) { foldTurns(items, busy, notesMode) }
     // follow the stream only while the reader is at the bottom; a drag up pins the view where they are
     var stick by remember { mutableStateOf(true) }
     val dragged by listState.interactionSource.collectIsDraggedAsState()
@@ -318,7 +319,7 @@ fun ChatScreen(nav: NavHostController) {
                 val lastU = rows.indexOfLast { it is Seg.Item && it.item is ChatItem.User }
                 itemsIndexed(rows, key = { _, it -> it.key }) { i, r ->
                     when (r) {
-                        is Seg.Work -> WorkBlock(r, status)
+                        is Seg.Work -> WorkBlock(r, status, notesMode, openLive)
                         is Seg.Item -> ChatRow(r.item, stats = r.stats, canRegen = i == lastA && i > lastU && !busy,
                             onEdit = { u -> editing = u },
                             onRegen = { scope.launch { g.regenerate() } })
@@ -1332,21 +1333,31 @@ private fun RunSettings() {
 
 /** A whole turn's reasoning and tool calls, folded to one line. Tap to see the steps. */
 @Composable
-private fun WorkBlock(w: Seg.Work, status: String) {
+private fun WorkBlock(w: Seg.Work, status: String, notesMode: String = "fold", openLive: Boolean = false) {
     val p = LocalPalette.current
-    var open by rememberSaveable(w.key) { mutableStateOf(false) }
+    // null = follow the default (open while live when asked to, folded once done); a tap pins it
+    var pinned by rememberSaveable(w.key) { mutableStateOf<Boolean?>(null) }
+    val open = pinned ?: (w.live && openLive)
     val items by app.gateway.items.collectAsStateWithLifecycle()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     if (w.live) LaunchedEffect(w.key) { while (true) { now = System.currentTimeMillis(); kotlinx.coroutines.delay(1000) } }
     val start = w.startMs
+    val notes = w.notes
     val title = when {
         w.live -> liveActivity(items, status)
         start > 0 && w.endMs > start -> "Worked for ${fmtDur(w.endMs - start)}"
         w.toolCount > 0 -> "Worked through ${w.toolCount} step${if (w.toolCount == 1) "" else "s"}"
         else -> "Thought it through"
     }
+    // what it folded away, so you know what's behind the tap
+    val detail = if (w.live) "" else listOfNotNull(
+        w.toolCount.takeIf { it > 0 }?.let { "$it step${if (it == 1) "" else "s"}" },
+        notes.size.takeIf { it > 0 }?.let { "$it note${if (it == 1) "" else "s"}" },
+    ).joinToString(" · ")
+    // live narration: the newest note Hermes wrote while working, shown until the turn ends and it folds away
+    val liveNote = if (w.live && notesMode == "fold" && !open) notes.lastOrNull() else null
     Column(Modifier.fillMaxWidth().entrance().animateContentSize(spring(dampingRatio = 0.9f, stiffness = Spring.StiffnessMediumLow))) {
-        Row(Modifier.clip(RoundedCornerShape(14.dp)).clickable { open = !open }.padding(vertical = 6.dp, horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.clip(RoundedCornerShape(14.dp)).clickable { pinned = !open }.padding(vertical = 6.dp, horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             if (w.live) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = p.accent)
             else Icon(Icons.Outlined.AutoAwesome, null, tint = p.faint, modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(8.dp))
@@ -1354,10 +1365,22 @@ private fun WorkBlock(w: Seg.Work, status: String) {
                 Text(t, color = p.muted, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (w.live && start > 0) Text("  " + fmtDur(now - start), color = p.faint, style = MaterialTheme.typography.labelSmall)
+            if (detail.isNotEmpty()) Text("  ·  $detail", color = p.faint, style = MaterialTheme.typography.labelSmall, maxLines = 1)
             Icon(if (open) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, if (open) "Hide steps" else "Show steps", tint = p.faint, modifier = Modifier.size(18.dp))
         }
+        AnimatedVisibility(liveNote != null, enter = fadeIn(tween(200)) + expandVertically(), exit = fadeOut(tween(160)) + shrinkVertically()) {
+            AnimatedContent(liveNote, transitionSpec = { (fadeIn(tween(220)) + slideInVertically { it / 3 }) togetherWith (fadeOut(tween(140)) + slideOutVertically { -it / 3 }) }, label = "note") { n ->
+                if (n != null) Row(Modifier.padding(start = 4.dp, top = 2.dp, bottom = 4.dp).height(IntrinsicSize.Min).clickable { pinned = true }) {
+                    Box(Modifier.width(2.dp).fillMaxHeight().clip(RoundedCornerShape(1.dp)).background(p.accent.copy(alpha = 0.45f)))
+                    Column(Modifier.padding(start = 12.dp)) {
+                        Text(n.text.trim(), color = p.muted, style = MaterialTheme.typography.bodyMedium, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                        if (notes.size > 1) Text("${notes.size - 1} earlier note${if (notes.size == 2) "" else "s"} · tap to see every step", color = p.faint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 3.dp))
+                    }
+                }
+            }
+        }
         AnimatedVisibility(open) {
-            Column(Modifier.padding(start = 6.dp, top = 2.dp).border(width = 0.dp, color = androidx.compose.ui.graphics.Color.Transparent)) {
+            Column(Modifier.padding(start = 6.dp, top = 2.dp)) {
                 w.steps.forEach { st -> WorkStep(st) }
             }
         }

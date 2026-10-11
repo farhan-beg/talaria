@@ -473,9 +473,27 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         ws?.send(buildJsonObject { put("jsonrpc", "2.0"); put("id", id); put("error", buildJsonObject { put("code", code); put("message", msg) }) }.toString())
     }
 
+    /** (session, seq) pairs already handled: two sockets briefly attached to one chat deliver every frame twice. */
+    private val seenSeq = object : LinkedHashMap<String, Long>(512, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > 4096
+    }
+
+    private fun duplicateFrame(sid: String, p: JsonObject): Boolean {
+        if (sid.isBlank()) return false
+        val seq = (p["seq"] as? JsonPrimitive)?.longOrNull ?: return false
+        val key = "$sid#$seq"; val t = now()
+        synchronized(seenSeq) {
+            val at = seenSeq[key]
+            if (at != null && t - at < 30_000) { Diag.d("ws", "Dropped duplicate frame $key"); return true }
+            seenSeq[key] = t
+        }
+        return false
+    }
+
     private fun onEvent(p: JsonObject) {
         val type = p.s("type")
         val sid = p.s("session_id")
+        if (duplicateFrame(sid, p)) return
         val pl = p.o("payload") ?: JsonObject(emptyMap())
         when (type) {
             "gateway.ready" -> {}
@@ -763,6 +781,34 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
 
     // ── public chat API ──────────────────────────────────────────────────────
 
+    /** The part of a turn's run-together stream that the committed rows (in order) don't already show. */
+    private fun uncoveredTail(stream: String, committed: List<String>): String {
+        var rest = stream
+        for (c in committed) {
+            val t = c.trim(); if (t.isEmpty()) continue
+            val r = rest.trimStart()
+            rest = when {
+                r.startsWith(t) -> r.substring(t.length)
+                // whitespace between segments can differ: compare with runs of spaces collapsed
+                else -> {
+                    val norm = Regex("\\s+")
+                    val target = norm.replace(t, " ")
+                    var n = 0; var i = 0; var ok = true
+                    while (n < target.length && i < r.length) {
+                        val tc = target[n]; val rc = r[i]
+                        when {
+                            tc == ' ' && rc.isWhitespace() -> { while (i < r.length && r[i].isWhitespace()) i++; n++ }
+                            tc == rc -> { n++; i++ }
+                            else -> { ok = false; break }
+                        }
+                    }
+                    if (ok && n == target.length) r.substring(i) else return rest
+                }
+            }
+        }
+        return rest
+    }
+
     private fun applySnapshot(r: JsonObject) {
         val sameChat = storedSid.isNotBlank() && (r.sn("stored_session_id") ?: storedSid) == storedSid
         runtimeSid = r.s("session_id")
@@ -843,7 +889,10 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 }
             }
             r.o("inflight")?.let { inf ->
-                val partial = inf.s("assistant")
+                // inflight.assistant is every word streamed this turn, run together. Hermes also commits the
+                // turn's notes to history as it goes, so those are already in `list`: append only what's new,
+                // or the notes show twice in one bubble.
+                val partial = uncoveredTail(inf.s("assistant"), list.drop(from).filterIsInstance<ChatItem.Assistant>().map { it.text })
                 if (partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = true, startMs = turnStart)
                 inf.sn("status")?.let { status.value = it }
             }

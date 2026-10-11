@@ -141,14 +141,28 @@ fun SettingsScreen(nav: NavHostController) {
                 SettingToggle("Ambient light", "Slowly drifting glow behind the app", Icons.Outlined.WbTwilight, ambient) { app.store.set(app.store.ambient, "ambient", it) }
             }
         }
+        item { SectionLabel("While Hermes works") }
+        item {
+            val mode by app.store.workNotes.collectAsState()
+            val openLive by app.store.workOpenLive.collectAsState()
+            HCard(padding = 12.dp) {
+                Text("Notes between steps", color = p.ink, style = MaterialTheme.typography.titleSmall)
+                Text(when (mode) {
+                    "reply" -> "Every note joins the answer bubble, so the reply reads as one long message."
+                    "hidden" -> "Notes stay inside \"Worked for\", even while it works. Only the answer shows."
+                    else -> "See what it's doing as it goes, then the notes fold into \"Worked for\" and the answer stands alone."
+                }, color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
+                ChipRow(listOf("fold" to "Show, then fold", "reply" to "Keep in reply", "hidden" to "Hide"), mode) { app.store.set(app.store.workNotes, "work_notes", it) }
+                Spacer(Modifier.height(6.dp))
+                SettingToggle("Open steps while working", "Show every tool call and note live, then fold when the answer lands", Icons.Outlined.Notes, openLive) { app.store.set(app.store.workOpenLive, "work_open_live", it) }
+            }
+        }
         item { SectionLabel("For nerds") }
         item {
             val nerd by app.store.nerd.collectAsState()
             HCard(padding = 8.dp) {
                 val mdIn by app.store.markdownInput.collectAsState()
                 SettingToggle("Markdown in my messages", "Format bar and live styling while typing; your sent messages render bold, lists, code and more", Icons.Outlined.TextFormat, mdIn) { app.store.set(app.store.markdownInput, "markdown_input", it) }
-                val interimOn by app.store.interimInReply.collectAsState()
-                SettingToggle("Full reply", "Words Hermes writes between tool calls show in the reply, not tucked into \"Worked for\"", Icons.Outlined.Notes, interimOn) { app.store.set(app.store.interimInReply, "interim_in_reply", it) }
                 SettingToggle("Stats for nerds", "Tokens/sec, time to first token, output tokens and total time under each reply", Icons.Outlined.Speed, nerd) { app.store.set(app.store.nerd, "nerd_stats", it) }
                 ReactionsSetting()
             }

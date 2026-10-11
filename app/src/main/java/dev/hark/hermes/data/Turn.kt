@@ -6,6 +6,8 @@ sealed interface Seg {
     data class Item(val item: ChatItem, val stats: TurnStats? = null) : Seg { override val key get() = item.key }
     data class Work(override val key: String, val steps: List<ChatItem>, val live: Boolean, val tailMs: Long = 0) : Seg {
         val toolCount get() = steps.count { it is ChatItem.Tool }
+        /** Notes Hermes wrote to you between steps ("Found the databases. Let me look inside…"). */
+        val notes get() = steps.filter { it is ChatItem.Assistant && it.text.isNotBlank() }.map { it as ChatItem.Assistant }
         val startMs get() = steps.minOfOrNull { when (it) { is ChatItem.Tool -> it.startMs; is ChatItem.Assistant -> it.startMs; else -> 0L }.takeIf { t -> t > 0 } ?: Long.MAX_VALUE }?.takeIf { it != Long.MAX_VALUE } ?: 0L
         // through the end of the answer, so "Worked for" covers the whole turn
         val endMs get() = maxOf(tailMs, steps.maxOfOrNull { when (it) { is ChatItem.Tool -> maxOf(it.endMs, it.startMs); is ChatItem.Assistant -> maxOf(it.endMs, it.firstMs); else -> 0L } } ?: 0L)
@@ -16,7 +18,8 @@ sealed interface Seg {
  * Folds every turn's reasoning, tool calls and interim notes into a single Work block, leaving only
  * the user's message, the final answer (with its reasoning moved into the block) and any notices.
  */
-fun foldTurns(items: List<ChatItem>, busy: Boolean, keepInterim: Boolean = true): List<Seg> {
+fun foldTurns(items: List<ChatItem>, busy: Boolean, notesMode: String = "fold"): List<Seg> {
+    val keepInterim = notesMode == "reply"
     val out = mutableListOf<Seg>()
     var i = 0
     while (i < items.size) {

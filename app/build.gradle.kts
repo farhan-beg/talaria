@@ -13,8 +13,8 @@ android {
         applicationId = "dev.hark.hermes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 33
-        versionName = "1.14.16"
+        versionCode = 34
+        versionName = "1.14.17"
         // Problem reports: the inbox they go to, an optional HTTPS form endpoint that emails you directly
         // (Formspree, or Web3Forms with ?access_key=...), and the repo for "Open a GitHub issue".
         val reportEmail = (project.findProperty("talaria.reportEmail") as String?) ?: System.getenv("TALARIA_REPORT_EMAIL") ?: "farhanbeg3012@gmail.com"

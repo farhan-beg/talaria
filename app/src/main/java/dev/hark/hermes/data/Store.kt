@@ -217,6 +217,14 @@ class Store(context: Context) {
     val markdownInput = flag("markdown_input", true)
     /** Text written between tool calls joins the reply bubble instead of hiding in "Worked for". */
     val interimInReply = flag("interim_in_reply", true)
+    /**
+     * Notes Hermes writes between tool calls ("Let me check the logs…"):
+     * "fold" shows them live while it works, then folds them into "Worked for" so the answer stands alone;
+     * "reply" joins them into the answer bubble (the pre-1.14.17 behaviour); "hidden" keeps them in "Worked for" even live.
+     */
+    val workNotes = str("work_notes", "fold")
+    /** Open the live "working" block automatically so every step is visible as it happens. */
+    val workOpenLive = flag("work_open_live", false)
     /** Phone TTS: voice name ("" = engine default), speech rate and pitch (1.0 = normal). */
     val phoneVoice = str("phone_voice", "")
     val phoneRate = str("phone_rate", "1.0")
