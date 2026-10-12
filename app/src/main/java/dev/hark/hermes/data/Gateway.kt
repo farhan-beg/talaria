@@ -30,12 +30,14 @@ sealed interface ChatItem {
         val startMs: Long = 0, val firstMs: Long = 0, val endMs: Long = 0, val chars: Int = 0, val outTokens: Long = 0,
         // durable messages.id (reactions address it) and the Tapback-style reactions on it
         val rowId: Long? = null, val reactions: List<Reaction> = emptyList(),
+        /** Part of a turn we (re)joined mid-way: its speed and first-token time can't be measured, only size and span. */
+        val joined: Boolean = false,
     ) : ChatItem {
         /** Output tokens: exact when the server reported usage, otherwise ~4 chars per token. */
         val tokens: Long get() = if (outTokens > 0) outTokens else (chars / 4).toLong()
         val exact: Boolean get() = outTokens > 0
         fun tps(now: Long = System.currentTimeMillis()): Double {
-            if (firstMs == 0L) return 0.0
+            if (firstMs == 0L || joined) return 0.0
             val end = if (endMs > 0) endMs else now
             val secs = (end - firstMs) / 1000.0
             return if (secs < 0.25) 0.0 else tokens / secs
@@ -172,6 +174,13 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 if (isActive) { store.lastChat = v; store.lastChatBot = botProfile.value.orEmpty() } else store.setLastChat(serverId, frozenProfile, v)
             }
         }
+    /**
+     * Bumped whenever you switch chats (new, resume, branch, sign-out). A snapshot fetched under an older
+     * generation belongs to a chat you've left: it's dropped instead of repainting that chat's messages.
+     */
+    @Volatile private var sessionGen = 0
+    /** You picked a chat (or a new one) this run: a cold-start reopen of the last chat must not override that. */
+    @Volatile private var userChose = false
     private var seq = 0L
     private var userSeen = 0
     private fun k(p: String) = "$p-${seq++}"
@@ -344,10 +353,10 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 runCatching { rpc("client.capabilities", jsonOf("server_requests" to true)) }
                 // re-attach to the chat we were in so streaming and history pick up where they left off
                 if (wasReconnect && storedSid.isNotBlank() && !loadingSession.value) runCatching {
-                    val keep = storedSid
+                    val keep = storedSid; val gen0 = sessionGen
                     val r = resumeRpc(keep)
-                    if (storedSid == keep) applySnapshot(r)
-                } else if (!wasReconnect && storedSid.isBlank() && items.value.isEmpty() && isActive) {
+                    if (storedSid == keep && gen0 == sessionGen) applySnapshot(r)
+                } else if (!wasReconnect && !userChose && storedSid.isBlank() && items.value.isEmpty() && isActive) {
                     // cold start (process was killed while away): reopen the chat you were in, not a blank one
                     val last = store.lastChat
                     if (last.isNotBlank()) runCatching { resume(last, store.lastChatTitle.ifBlank { null }, bot = store.lastChatBot.ifBlank { null }) }
@@ -508,8 +517,8 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 val stored = pl.s("stored_session_id")
                 val ours = (dead.isNotBlank() && dead == runtimeSid) || (dead.isBlank() && stored.isNotBlank() && stored == storedSid)
                 if (ours && storedSid.isNotBlank()) {
-                    val keep = storedSid
-                    scope.launch { runCatching { if (storedSid == keep) applySnapshot(resumeRpc(keep)) } }
+                    val keep = storedSid; val gen0 = sessionGen
+                    scope.launch { runCatching { val s = resumeRpc(keep); if (storedSid == keep && gen0 == sessionGen) applySnapshot(s) } }
                 }
             }
             "request.cancel" -> { val id = pl.s("id"); asks.update { l -> l.filterNot { (it.id as? JsonPrimitive)?.content == id } } }
@@ -540,22 +549,26 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
 
     var turnStart = 0L
         private set
+    /** The running turn was picked up mid-way (reload, reconnect): its segments are marked `joined`. */
+    private var joinedTurn = false
     private var usageOutAtStart = 0L
     /** Whether usage was known when the turn began; a delta against an unknown baseline is the whole session's output. */
     private var usageKnownAtStart = false
     private fun markUsageBase() { usageOutAtStart = outOf(usage.value); usageKnownAtStart = usage.value != null }
     private fun outOf(u: JsonObject?): Long = u?.let { maxOf(it.l("output"), it.l("output_tokens"), it.l("completion_tokens")) } ?: 0L
     private fun now() = System.currentTimeMillis()
+    private fun isSessionGone(m: String) = m.contains("session not found", true) || m.contains("sessions not found", true) ||
+        m.contains("unknown session", true) || m.contains("no such session", true)
     private fun ChatItem.Assistant.ended() = if (streaming || endMs == 0L) copy(streaming = false, endMs = now()) else copy(streaming = false)
     private fun ChatItem.Assistant.got(t: String) = copy(firstMs = if (firstMs == 0L && t.isNotEmpty()) now() else firstMs, chars = chars + t.length)
 
     /** A reply that arrived whole (no deltas): stamp it so the turn still gets stats. */
-    private fun whole(t: String) = now().let { n -> ChatItem.Assistant(k("a"), t, startMs = if (turnStart > 0) turnStart else n, firstMs = n, endMs = n, chars = t.length) }
+    private fun whole(t: String) = now().let { n -> ChatItem.Assistant(k("a"), t, startMs = if (turnStart > 0) turnStart else n, firstMs = n, endMs = n, chars = t.length, joined = joinedTurn) }
 
     private fun ensureAssistant(): Int {
         val i = lastStreaming()
         if (i >= 0) return i
-        items.update { it + ChatItem.Assistant(k("a"), "", streaming = true, startMs = if (turnStart > 0) turnStart else now()) }
+        items.update { it + ChatItem.Assistant(k("a"), "", streaming = true, startMs = if (turnStart > 0) turnStart else now(), joined = joinedTurn) }
         return items.value.lastIndex
     }
 
@@ -567,7 +580,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             // a turn whose message.start we missed: open a fresh turn so its stats don't absorb the previous one's
             busy.value = true
             if (turnStart == 0L) {
-                turnStart = now(); markUsageBase()
+                turnStart = now(); markUsageBase(); joinedTurn = false
                 markServerTurn()
             }
         }
@@ -586,7 +599,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 val wasIdle = !busy.value
                 busy.value = true
                 // message.start can repeat inside one turn; only a turn that was idle restarts the clock
-                if (wasIdle || turnStart == 0L) { turnStart = now(); markUsageBase() }
+                if (wasIdle || turnStart == 0L) { turnStart = now(); markUsageBase(); joinedTurn = false }
                 // nobody here asked for this turn (a background agent, process, loop or heartbeat): mark where it begins
                 if (wasIdle) markServerTurn()
                 ensureAssistant()
@@ -680,13 +693,21 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 busy.value = false
                 status.value = ""
                 // the turn is over: the next one (yours, or one Hermes starts) times and counts from scratch
-                turnStart = 0L; markUsageBase()
+                turnStart = 0L; markUsageBase(); joinedTurn = false
                 val serverTurn = serverTurnKey
                 serverTurnKey = null
                 if (serverTurn != null || items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() })
                     scope.launch { runCatching { reconcile(serverTurn) } }
             }
-            "error" -> { items.update { it + ChatItem.Notice(k("n"), pl.s("message"), true) }; busy.value = false; status.value = "" }
+            "error" -> {
+                val msg = pl.s("message")
+                // a frame that reached a runtime the server already reaped (reload, reconnect, sleep): not a failed turn.
+                // Re-attach quietly instead of flashing an error and dropping the running turn's clock.
+                if (isSessionGone(msg) && storedSid.isNotBlank()) {
+                    val keep = storedSid; val gen0 = sessionGen
+                    scope.launch { runCatching { val s = resumeRpc(keep); if (storedSid == keep && gen0 == sessionGen) applySnapshot(s) } }
+                } else { items.update { it + ChatItem.Notice(k("n"), msg, true) }; busy.value = false; status.value = "" }
+            }
         }
     }
 
@@ -856,6 +877,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         }
         // a turn still running on the server: show what it has said so far and keep streaming into it
         val running = r.b("running") || r.o("info")?.b("running") == true
+        joinedTurn = running
         if (running) {
             // the running turn's own message isn't in history until the turn ends: bring it back from the
             // server's inflight copy (or what we sent from this phone), so steps attach to the right turn
@@ -883,7 +905,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             for (j in from until list.size) {
                 val it = list[j]
                 list[j] = when (it) {
-                    is ChatItem.Assistant -> it.copy(startMs = if (!anchored) turnStart else 0, firstMs = 0, endMs = 0).also { anchored = true }
+                    is ChatItem.Assistant -> it.copy(startMs = if (!anchored) turnStart else 0, firstMs = 0, endMs = 0, joined = true).also { anchored = true }
                     is ChatItem.Tool -> it.copy(startMs = if (!anchored) turnStart else 0).also { anchored = true }
                     else -> it
                 }
@@ -893,7 +915,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 // turn's notes to history as it goes, so those are already in `list`: append only what's new,
                 // or the notes show twice in one bubble.
                 val partial = uncoveredTail(inf.s("assistant"), list.drop(from).filterIsInstance<ChatItem.Assistant>().map { it.text })
-                if (partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = true, startMs = turnStart)
+                if (partial.isNotBlank()) list += ChatItem.Assistant(k("a"), partial, streaming = true, startMs = turnStart, joined = true)
                 inf.sn("status")?.let { status.value = it }
             }
         }
@@ -1070,7 +1092,11 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
 
     private suspend fun startChat(bot: String?, title: String?) {
         loadingSession.value = true
+        val gen = ++sessionGen
+        userChose = true
         try {
+            // let go of the old chat now: its late events and any resume still in flight must not land here
+            runtimeSid = ""; storedSid = ""
             items.value = emptyList(); this.title.value = title ?: "New chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
             botProfile.value = bot
             val p = profileNow()
@@ -1084,25 +1110,36 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 "fast" to (if (fast && store.fastPref.value) true else null), "idempotency_key" to idem, "title" to title)
             val r = try { rpc("session.create", params(true)) }
                 catch (e: java.io.IOException) { if (!e.message.orEmpty().contains("fast")) throw e; rpc("session.create", params(false)) }
+            if (gen != sessionGen) return   // you moved on while it was being made
             storedSid = r.s("stored_session_id")
             store.markMine(storedSid)
             applySnapshot(r)
             if (title != null) this.title.value = title
             runCatching { loadRunSettings() }
-        } finally { loadingSession.value = false }
+        } finally { if (gen == sessionGen) loadingSession.value = false }
     }
 
     suspend fun resume(stored: String, t: String?, bot: String? = null) {
         loadingSession.value = true
+        val gen = ++sessionGen
+        userChose = true
         try {
+            runtimeSid = ""
             items.value = emptyList(); title.value = t?.ifBlank { null } ?: "Chat"; usage.value = null; busy.value = false; attachments.value = emptyList()
             botProfile.value = bot
             runCatching { if (isActive) store.lastChatTitle = t.orEmpty() }
             todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
             storedSid = stored
-            applySnapshot(resumeRpc(stored))
+            // a chat the server is still waking (it reaped the idle runtime) can answer "not found" for a beat
+            val snap = try { resumeRpc(stored) } catch (e: Exception) {
+                if (!isSessionGone(e.message.orEmpty()) || gen != sessionGen) throw e
+                kotlinx.coroutines.delay(700); if (gen != sessionGen) return
+                resumeRpc(stored)
+            }
+            if (gen != sessionGen) return
+            applySnapshot(snap)
             runCatching { loadRunSettings() }
-        } finally { loadingSession.value = false }
+        } finally { if (gen == sessionGen) loadingSession.value = false }
     }
 
     suspend fun send(text: String, queue: Boolean = busy.value) {
@@ -1503,7 +1540,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         val r = rpc("rollback.restore", jsonOf("session_id" to runtimeSid, "hash" to hash, "file_path" to file?.ifBlank { null }))
         if (!r.b("success")) throw IllegalStateException(r.sn("error") ?: r.sn("reason") ?: "Couldn't restore that checkpoint")
         // a full restore also rewinds the conversation: reload it so the transcript matches the files
-        if (r.l("history_removed") > 0 && storedSid.isNotBlank()) runCatching { val keep = storedSid; val s = resumeRpc(keep); if (storedSid == keep) applySnapshot(s) }
+        if (r.l("history_removed") > 0 && storedSid.isNotBlank()) runCatching { val keep = storedSid; val gen0 = sessionGen; val s = resumeRpc(keep); if (storedSid == keep && gen0 == sessionGen) applySnapshot(s) }
         return r
     }
 
@@ -1513,8 +1550,10 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
     suspend fun branch(name: String? = null) {
         if (runtimeSid.isBlank()) return
         loadingSession.value = true
+        val gen = ++sessionGen
         try {
             val r = rpc("session.branch", jsonOf("session_id" to runtimeSid, "name" to name?.ifBlank { null }, "idempotency_key" to java.util.UUID.randomUUID().toString()))
+            if (gen != sessionGen) return
             val wasMine = store.isMine(storedSid)
             todos.value = emptyList(); subagents.value = emptyMap(); control.value = null
             storedSid = r.s("stored_session_id")
@@ -1523,7 +1562,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             runCatching { if (isActive) store.lastChatTitle = title.value }
             applySnapshot(r)
             items.update { it + ChatItem.Notice(k("n"), "Branched from “${r.sn("parent")?.take(40) ?: "the original"}”") }
-        } finally { loadingSession.value = false }
+        } finally { if (gen == sessionGen) loadingSession.value = false }
     }
 
     /** Drop the last turn you sent (and its reply) from this chat. */
@@ -1604,7 +1643,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
     suspend fun setReactionsVisible(on: Boolean): Boolean =
         rpc("config.set", jsonOf("key" to "display.message_reactions", "value" to on)).let { r -> (r["value"] as? JsonPrimitive)?.booleanOrNull ?: on }
 
-    fun reset() { disconnect(); botProfile.value = null; runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
+    fun reset() { sessionGen++; userChose = false; disconnect(); botProfile.value = null; runtimeSid = ""; storedSid = ""; items.value = emptyList(); title.value = "New chat"
         todos.value = emptyList(); subagents.value = emptyMap(); control.value = null; asks.value = emptyList() }
 }
 

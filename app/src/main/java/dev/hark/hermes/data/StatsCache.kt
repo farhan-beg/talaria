@@ -13,7 +13,7 @@ object StatsCache {
     private fun id(text: String) = text.trim().hashCode().toString(36) + ":" + text.trim().length
 
     fun save(a: ChatItem.Assistant) {
-        if (a.firstMs <= 0 || a.text.isBlank()) return
+        if (a.firstMs <= 0 || a.text.isBlank() || a.joined) return
         runCatching {
             val e = prefs.edit().putString(id(a.text), "${a.startMs},${a.firstMs},${a.endMs},${a.outTokens},${a.chars},${System.currentTimeMillis()}")
             e.apply()

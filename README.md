@@ -2,7 +2,7 @@
 
 An independent Android client for Hermes Agent servers.
 
-Version 1.14.17 (versionCode 34). Not affiliated with Nous Research.
+Version 1.14.18 (versionCode 35). Not affiliated with Nous Research.
 
 Site: <https://farhan-beg.github.io/talaria/>
 

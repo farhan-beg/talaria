@@ -862,7 +862,7 @@ private fun NerdStats(a: TurnStats) {
         Spacer(Modifier.width(4.dp))
         val stat = MaterialTheme.typography.labelSmall.copy(fontFamily = Mono, letterSpacing = 0.sp)
         Text(if (tps > 0) "%.1f tok/s".format(tps) else "— tok/s", color = speedColor, style = stat)
-        Text("  ·  $tok tok  ·  TTFT %.2fs  ·  %.1fs".format(ttft, total), color = p.muted, style = stat, maxLines = 1)
+        Text("  ·  $tok tok" + (if (ttft > 0) "  ·  TTFT %.2fs".format(ttft) else "") + "  ·  %.1fs".format(total), color = p.muted, style = stat, maxLines = 1)
     }
 }
 

@@ -116,8 +116,10 @@ data class TurnStats(val segs: List<ChatItem.Assistant>) {
     val startMs get() = segs.filter { it.startMs > 0 }.minOfOrNull { it.startMs } ?: segs.filter { it.firstMs > 0 }.minOfOrNull { it.firstMs } ?: 0L
     val firstMs get() = segs.filter { it.firstMs > 0 }.minOfOrNull { it.firstMs } ?: 0L
     fun genSecs(now: Long) = segs.filter { it.firstMs > 0 }.sumOf { ((if (it.endMs > 0) it.endMs else now) - it.firstMs).coerceAtLeast(0) } / 1000.0
-    fun tps(now: Long = System.currentTimeMillis()): Double { val g = genSecs(now); return if (g < 0.25) 0.0 else tokens / g }
-    fun ttft() = if (startMs > 0 && firstMs > 0) (firstMs - startMs) / 1000.0 else 0.0
+    /** Rejoined mid-turn: the tokens and the span are real, the speed and first-token time aren't measurable. */
+    val joined get() = segs.any { it.joined }
+    fun tps(now: Long = System.currentTimeMillis()): Double { if (joined) return 0.0; val g = genSecs(now); return if (g < 0.25) 0.0 else tokens / g }
+    fun ttft() = if (!joined && startMs > 0 && firstMs > 0) (firstMs - startMs) / 1000.0 else 0.0
     fun total(now: Long) = ((segs.maxOfOrNull { if (it.endMs > 0) it.endMs else if (it.streaming) now else it.firstMs } ?: 0L) - startMs).coerceAtLeast(0) / 1000.0
     companion object { fun of(segs: List<ChatItem.Assistant>) = TurnStats(segs).takeIf { it.firstMs > 0 } }
 }
