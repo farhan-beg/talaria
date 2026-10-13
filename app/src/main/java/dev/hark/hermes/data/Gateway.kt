@@ -752,7 +752,7 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             // the turn's own row may be hidden (dropped from history): then the newest row is one we already show
             val known = items.value.filterIsInstance<ChatItem.User>()
             val maxRow = known.mapNotNull { it.rowId }.maxOrNull() ?: 0L
-            val stale = u0 != null && ((u0.l("row_id") in 1..maxRow) || (maxRow == 0L && known.lastOrNull()?.raw?.trim() == u0.s("text").trim()))
+            val stale = u0 != null && ((u0.l("row_id") in 1..maxRow) || (maxRow == 0L && known.lastOrNull()?.raw?.trim() == splitExpansion(u0.s("text")).first.trim()))
             val u = if (stale) null else u0
             if (u0 != null && u == null) items.update { l -> l.map { if (it.key == boundaryKey) ChatItem.Notice(it.key, "", boundary = true) else it } }
             if (u != null) {
@@ -771,10 +771,27 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
         if (items.value.any { it is ChatItem.Assistant && it.rowId == null && it.text.isNotBlank() }) syncRowIds()
     }
 
+    private val EXPANSION_HEAD = Regex("^--- (Attached Context|Context Warnings) ---\\s*$")
+    private val EXPANDED_REF = Regex("^(?:📄|📁|📎|🌐|📌) (@(file|folder|url|image|[a-zA-Z][\\w-]*):\\S+)")
+
+    /**
+     * Hermes stores a message with its @-references expanded: what you typed, then "--- Context Warnings ---" and
+     * "--- Attached Context ---" carrying each file's whole text. That's for the model; the bubble shows what you
+     * typed. Returns (your text, [(kind, @ref)] of each attached block).
+     */
+    private fun splitExpansion(full: String): Pair<String, List<Pair<String, String>>> {
+        val lines = full.lines()
+        val at = lines.indexOfFirst { EXPANSION_HEAD.matches(it.trim()) }
+        if (at < 0) return full to emptyList()
+        val refs = lines.drop(at).mapNotNull { EXPANDED_REF.find(it.trim())?.let { m -> m.groupValues[2] to m.groupValues[1] } }.distinctBy { it.second }
+        return lines.take(at).joinToString("\n").trimEnd() to refs
+    }
+
     private val ATTACH_LINE = Regex("^@(image|file|folder):(\\S.*)$")
 
     /** A stored user row as a bubble: leading @file refs and trailing @image refs become chips, `raw` keeps the original. */
-    private fun userFromHistory(m: JsonObject, txt: String, ord: Int): ChatItem.User {
+    private fun userFromHistory(m: JsonObject, full: String, ord: Int): ChatItem.User {
+        val (txt, expanded) = splitExpansion(full)
         val lines = txt.lines()
         val files = mutableListOf<Attachment>()
         var from = 0
@@ -795,6 +812,11 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
             val g = ATTACH_LINE.find(l)?.groupValues ?: break
             if (g[1] != "image") break
             files += Attachment(g[2].substringAfterLast('/'), "image", path = g[2]); to--
+        }
+        // older servers stripped the @file token from the sentence: recover the chips from the attached blocks' headers
+        if (files.isEmpty()) expanded.forEach { (kind, ref) ->
+            val path = ref.substringAfter(':').trim('`', '"', '\'')
+            files += Attachment(path.substringAfterLast('/'), if (kind == "folder") "file" else kind.takeIf { it == "image" } ?: "file", path = path, ref = ref)
         }
         val shown = if (files.isEmpty()) txt else lines.subList(from, to).joinToString("\n").trim()
         return ChatItem.User(k("u"), shown, txt, m["row_id"]?.let { m.l("row_id") }?.takeIf { it > 0 }, ord, files, reactions = parseReactions(m["display_metadata"]))
@@ -886,12 +908,14 @@ class Gateway(private val api: Api, private val store: Store, val serverId: Stri
                 ?: (inf?.o("user"))?.s("text")?.takeIf { it.isNotBlank() }
                 ?: if (sameChat) (items.value.lastOrNull { it is ChatItem.User } as? ChatItem.User)?.text else null
             val lastHist = list.lastOrNull { it is ChatItem.User } as? ChatItem.User
+            val pendingTyped = pending?.let { splitExpansion(it).first.trim() }
             val pendingNote = pending?.let { machineNote(inf?.sn("display_kind") ?: inf?.o("user")?.sn("display_kind"), it, inf?.get("display_metadata")) }
             if (pendingNote != null) {
                 if (pendingNote.isNotEmpty() && (list.lastOrNull { it.startsTurn() } as? ChatItem.Notice)?.text != pendingNote) list += ChatItem.Notice(k("n"), pendingNote, boundary = true)
-            } else if (pending != null && pending.trim() != lastHist?.text?.trim()) {
-                val mine = if (!sameChat) null else items.value.lastOrNull { it is ChatItem.User && it.text.trim() == pending.trim() } as? ChatItem.User
-                list += mine?.copy(ordinal = ord) ?: ChatItem.User(k("u"), pending, pending, null, ord)
+            } else if (pending != null && pendingTyped != lastHist?.raw?.trim() && pendingTyped != lastHist?.text?.trim()) {
+                // compare what was typed (the stored row is expanded, a file-only message shows as a bare chip)
+                val mine = if (!sameChat) null else items.value.lastOrNull { it is ChatItem.User && (it.text.trim() == pendingTyped || it.raw.trim() == pendingTyped) } as? ChatItem.User
+                list += mine?.copy(ordinal = ord) ?: userFromHistory(JsonObject(emptyMap()), pending, ord)
                 ord++
             }
             // time the turn from when the server started it, not from when we reconnected
