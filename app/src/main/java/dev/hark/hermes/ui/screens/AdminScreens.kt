@@ -69,30 +69,99 @@ fun KeysScreen(nav: NavHostController) {
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
+/** One top-level block of config.yaml: the comments above a key, the key, and everything indented under it. */
+private data class YamlSection(val key: String, val text: String)
+
+private const val SLICE = 300
+private val TOP_KEY = Regex("^([A-Za-z0-9_\"'][^:#]*?)\\s*:")
+
+/** Splits YAML at top-level keys. Joining the sections' text with "\n" gives back the file byte for byte. */
+private fun splitYaml(yaml: String): List<YamlSection> {
+    val lines = yaml.split("\n")
+    val out = mutableListOf<YamlSection>()
+    var buf = mutableListOf<String>()
+    var key: String? = null
+    var lead = mutableListOf<String>()   // comments / blank lines waiting to attach to the next key
+    fun flush() { if (buf.isNotEmpty()) out += YamlSection(key ?: "(top of file)", buf.joinToString("\n")); buf = mutableListOf() }
+    for (ln in lines) {
+        val m = TOP_KEY.find(ln)
+        when {
+            m != null && !ln.startsWith(" ") && !ln.startsWith("\t") -> { flush(); key = m.groupValues[1].trim('"', '\''); buf.addAll(lead); lead = mutableListOf(); buf += ln }
+            (ln.isBlank() || ln.startsWith("#")) && key != null -> lead += ln
+            else -> { buf.addAll(lead); lead = mutableListOf(); buf += ln }
+        }
+    }
+    buf.addAll(lead); flush()
+    // a huge block (thousands of lines) still makes one field too tall to measure: edit it in slices
+    return out.ifEmpty { listOf(YamlSection("(top of file)", yaml)) }.flatMap { sec ->
+        val ls = sec.text.split("\n")
+        if (ls.size <= SLICE) listOf(sec)
+        else ls.chunked(SLICE).mapIndexed { n, part -> YamlSection("${sec.key} · lines ${n * SLICE + 1}–${n * SLICE + part.size}", part.joinToString("\n")) }
+    }
+}
+
+/**
+ * config.yaml edited one top-level block at a time. A single text field holding the whole file grew taller
+ * than Compose can measure on big configs (crash: "Can't represent a width of 990 and height of 288886") and
+ * crawled long before that; each block now gets its own field with a capped height that scrolls inside.
+ */
 @Composable
 fun ConfigScreen(nav: NavHostController) {
     val p = LocalPalette.current
     val scope = rememberCoroutineScope()
     val profile by app.store.profile.collectAsState()
     val raw = rememberLoad(profile) { app.api.obj("/api/config/raw") }
-    var text by remember(raw.data) { mutableStateOf(raw.data?.s("yaml") ?: "") }
-    val dirty = raw.data != null && text != raw.data?.s("yaml")
+    val original = raw.data?.s("yaml") ?: ""
+    val base = remember(raw.data) { splitYaml(original) }
+    val texts = remember(raw.data) { mutableStateListOf<String>().apply { addAll(base.map { it.text }) } }
+    val open = remember(raw.data) { mutableStateListOf<Int>() }
+    var q by remember { mutableStateOf("") }
+    val joined = texts.joinToString("\n")
+    val dirty = raw.data != null && joined != original
+    var discard by remember { mutableStateOf(false) }
+    val mono = LocalTextStyle.current.copy(fontFamily = Mono, fontSize = androidx.compose.ui.unit.TextUnit(12.5f, androidx.compose.ui.unit.TextUnitType.Sp), color = p.ink)
     Page("Config", subtitle = raw.data?.sn("path") ?: "config.yaml", onBack = { nav.popBackStack() },
+        onRefresh = { if (dirty) discard = true else raw.reload() }, refreshing = raw.loading && raw.data != null,
         actions = {
-            TextButton({ scope.act("Saved. Applies to new sessions.", after = { raw.reload() }) { app.api.put("/api/config/raw", jsonOf("yaml_text" to text)) } }, enabled = dirty) {
+            TextButton({ scope.act("Saved. Applies to new sessions.", after = { raw.reload() }) { app.api.put("/api/config/raw", jsonOf("yaml_text" to joined)) } }, enabled = dirty) {
                 Text("Save", color = if (dirty) p.accent else p.faint)
             }
         }) {
         loadState(raw) {
-            item {
-                OutlinedTextField(text, { text = it }, modifier = Modifier.fillMaxWidth().heightIn(min = 500.dp),
-                    textStyle = LocalTextStyle.current.copy(fontFamily = Mono, fontSize = androidx.compose.ui.unit.TextUnit(12.5f, androidx.compose.ui.unit.TextUnitType.Sp), color = p.ink),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-                    colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = p.card, focusedContainerColor = p.card, unfocusedBorderColor = p.line))
+            item("search") { SearchField(q, { q = it }, "Find a setting") }
+            item("bar") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${base.size} sections · ${original.count { it == '\n' } + 1} lines", color = p.muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                    TextButton({ if (open.size == texts.size) open.clear() else { open.clear(); open.addAll(texts.indices) } }) {
+                        Text(if (open.size == texts.size) "Collapse all" else "Expand all", color = p.accent)
+                    }
+                }
             }
-            item { Text("Changes take effect on the next session or gateway restart.", color = p.muted, style = MaterialTheme.typography.bodySmall) }
+            texts.indices.filter { i -> q.isBlank() || base[i].key.contains(q, true) || texts[i].contains(q, true) }.forEach { i ->
+                item("sec-$i") {
+                    val changed = texts[i] != base[i].text
+                    val expanded = i in open || (q.isNotBlank() && !base[i].key.contains(q, true))
+                    HCard(padding = 12.dp) {
+                        Row(Modifier.fillMaxWidth().press { if (i in open) open.remove(i) else open.add(i) }, verticalAlignment = Alignment.CenterVertically) {
+                            Text(base[i].key, color = p.ink, fontFamily = Mono, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            if (changed) { Pill("edited", p.warn); Spacer(Modifier.width(8.dp)) }
+                            Text("${texts[i].count { it == '\n' } + 1}", color = p.faint, style = MaterialTheme.typography.labelSmall)
+                            Icon(if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null, tint = p.muted)
+                        }
+                        if (expanded) {
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(texts[i], { texts[i] = it }, modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp, max = 520.dp),
+                                textStyle = mono, shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                                colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = p.card, focusedContainerColor = p.card, unfocusedBorderColor = p.line))
+                            if (changed) TextButton({ texts[i] = base[i].text }) { Text("Undo changes", color = p.muted) }
+                        }
+                    }
+                }
+            }
+            item("foot") { Text("Changes take effect on the next session or gateway restart.", color = p.muted, style = MaterialTheme.typography.bodySmall) }
         }
     }
+    if (discard) ConfirmDialog("Discard your edits?", "Reloading pulls config.yaml from the server again.", "Discard", true, { discard = false }) { raw.reload() }
 }
 
 // ── System ────────────────────────────────────────────────────────────────────
