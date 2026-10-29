@@ -268,12 +268,15 @@ class Api(private val store: Store) {
         val first = try {
             snapshotFor(id, prof)
         } catch (e: ApiException) {
-            // No snapshot route: a server from before mutation fencing, whose writes need no identity.
-            if (e.code == 404) return plainEdit(id, payload, delete, prof)
+            // FastAPI's own route miss ("Not Found") means a backend from before mutation fencing,
+            // whose writes need no identity. A real `not_found` is about the row, not the route.
+            if (e.code == 404 && e.message.equals("Not Found", ignoreCase = true)) return plainEdit(id, payload, delete, prof)
             throw friendlyMutation(e)
         }
-        if (delete && first["exists"]?.jsonPrimitive?.booleanOrNull == false)
-            return JsonObject(mapOf("ok" to JsonPrimitive(true), "already_absent" to JsonPrimitive(true)))
+        if (first["exists"]?.jsonPrimitive?.booleanOrNull == false) {
+            if (delete) return JsonObject(mapOf("ok" to JsonPrimitive(true), "already_absent" to JsonPrimitive(true)))
+            throw ApiException(404, "This session no longer exists.")
+        }
         try {
             return fencedSend(id, payload, delete, prof, fenceFor(UUID.randomUUID().toString(), first))
         } catch (e: ApiException) {
@@ -294,14 +297,19 @@ class Api(private val store: Store) {
 
     private fun friendlyMutation(e: ApiException): ApiException {
         val m = e.message.orEmpty()
-        return when {
-            m.contains("revision_conflict") || m.contains("stale_generation") ->
-                ApiException(e.code, "This chat changed on another device. Refresh and try again.")
-            m.contains("session_busy") -> ApiException(e.code, "Hermes is still working on this chat. Try again in a moment.")
-            m.contains("client_upgrade_required") || m.contains("mutation_identity_required") ->
-                ApiException(e.code, "This server needs a newer Talaria for chat edits. Update the app.")
-            else -> e
+        val nice = when {
+            m.contains("session_busy") || m.contains("admission_conflict") -> "Hermes is working in this chat. Try again when the turn finishes."
+            m.contains("revision_conflict") || m.contains("stale_generation") -> "This chat changed on another device. Refresh and try again."
+            m.contains("permission_denied") -> "This account can't edit that session."
+            m.contains("profile_mismatch") -> "That session belongs to another profile."
+            m.contains("runtime_draining") -> "Hermes is restarting. Try again in a moment."
+            m.contains("storage_unavailable") -> "Hermes couldn't reach its session store. Try again."
+            m == "not_found" -> "This session no longer exists."
+            m.startsWith("client_upgrade_required") || m.contains("mutation_identity_required") ->
+                "This server needs a newer Talaria for chat edits. Update the app."
+            else -> return e
         }
+        return ApiException(e.code, nice)
     }
 
     /**
