@@ -1,6 +1,7 @@
 package dev.hark.hermes.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.sync.Mutex
@@ -12,6 +13,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.URLEncoder
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class ApiException(val code: Int, message: String) : IOException(message)
@@ -182,6 +184,189 @@ class Api(private val store: Store) {
 
     suspend fun obj(path: String, profile: Boolean = true): JsonObject = get(path, profile).objOrNull() ?: JsonObject(emptyMap())
     suspend fun arr(path: String, profile: Boolean = true): JsonArray = get(path, profile).arrOrEmpty()
+
+    /** WebSocket RPC, set by the app; used when REST refuses a stored row the serving owner can't mount. */
+    var rpcFallback: (suspend (String, JsonObject) -> JsonObject)? = null
+    /** Called with a stored session id just before its live gateway runtime is closed for a delete. */
+    var onLiveClose: (suspend (String) -> Unit)? = null
+
+    private class Fence(val requestId: String, val revision: Long, val generation: Long?)
+
+    /**
+     * Hermes only commits a session edit that carries the identity it handed out for the row: a
+     * request id plus the revision that row was read at. Fetch that snapshot first; a server from
+     * before mutation fencing has no such route, and its writes still take a plain PATCH/DELETE.
+     */
+    private suspend fun snapshotFor(id: String, prof: String?): JsonObject =
+        obj("/api/sessions/${enc(id)}/mutation-snapshot" + (prof?.let { "?profile=" + enc(it) } ?: ""))
+
+    private fun fenceFor(requestId: String, snap: JsonObject): Fence {
+        val exists = snap["exists"]?.jsonPrimitive?.booleanOrNull
+        val rev = snap["runtime_revision"]?.jsonPrimitive?.longOrNull
+        if (exists == null || rev == null || rev < 0)
+            throw ApiException(409, "Hermes didn't return a session snapshot. Refresh and try again.")
+        return Fence(requestId, rev, if (exists) snap["runtime_generation"]?.jsonPrimitive?.longOrNull else null)
+    }
+
+    private suspend fun sendFenced(id: String, payload: JsonObject?, isDelete: Boolean, prof: String?, fence: Fence): JsonElement {
+        val base = "/api/sessions/${enc(id)}"
+        if (isDelete) {
+            val q = buildString {
+                append("request_id=").append(enc(fence.requestId))
+                append("&expected_revision=").append(fence.revision)
+                fence.generation?.let { append("&expected_generation=").append(it) }
+                prof?.let { append("&profile=").append(enc(it)) }
+            }
+            return delete("$base?$q")
+        }
+        val body = buildJsonObject {
+            payload?.forEach { (k, v) -> put(k, v) }
+            put("request_id", fence.requestId)
+            put("expected_revision", fence.revision)
+            fence.generation?.let { put("expected_generation", it) }
+            prof?.let { put("profile", it) }
+        }
+        return patch(base, body)
+    }
+
+    /**
+     * A fenced write, retried the way the protocol wants it. A conflict means someone else edited
+     * the row first: re-read its revision and resend under the SAME request id, so a write that did
+     * commit is replayed as its receipt instead of landing twice. A lost reply is ambiguous in the
+     * same way, so it is resent with the identical identity too.
+     */
+    private suspend fun fencedSend(id: String, payload: JsonObject?, isDelete: Boolean, prof: String?, start: Fence): JsonElement {
+        var fence = start
+        repeat(3) { attempt ->
+            try {
+                return sendFenced(id, payload, isDelete, prof, fence)
+            } catch (e: ApiException) {
+                val m = e.message.orEmpty()
+                if (attempt < 2 && (m.contains("revision_conflict") || m.contains("stale_generation"))) {
+                    Diag.w("session", "mutation ${id.take(8)}: $m, re-reading the snapshot")
+                    fence = fenceFor(fence.requestId, snapshotFor(id, prof))
+                    return@repeat
+                }
+                throw e
+            } catch (e: AuthExpired) {
+                throw e
+            } catch (e: IOException) {
+                if (attempt < 2) { delay(350); return@repeat }
+                throw e
+            }
+        }
+        throw ApiException(409, "Hermes didn't confirm the change. Refresh and try again.")
+    }
+
+    /**
+     * A session edit that works on rows the serving owner won't mount over REST: older history,
+     * rows written by another client. Those answer `not_found` even to a fenced write; the
+     * gateway's own store handle still has them, so fall back to its RPCs.
+     */
+    suspend fun mutateSession(id: String, payload: JsonObject?, delete: Boolean = false, profile: String? = null): JsonElement {
+        val prof = profile?.takeIf { it.isNotBlank() } ?: store.profile.value.takeIf { it.isNotBlank() }
+        val first = try {
+            snapshotFor(id, prof)
+        } catch (e: ApiException) {
+            // No snapshot route: a server from before mutation fencing, whose writes need no identity.
+            if (e.code == 404) return plainEdit(id, payload, delete, prof)
+            throw friendlyMutation(e)
+        }
+        if (delete && first["exists"]?.jsonPrimitive?.booleanOrNull == false)
+            return JsonObject(mapOf("ok" to JsonPrimitive(true), "already_absent" to JsonPrimitive(true)))
+        try {
+            return fencedSend(id, payload, delete, prof, fenceFor(UUID.randomUUID().toString(), first))
+        } catch (e: ApiException) {
+            val m = e.message.orEmpty()
+            if (!(e.code == 404 && m.contains("not_found")) && !m.contains("session_read_only")) throw friendlyMutation(e)
+            Diag.w("session", "mutation ${id.take(8)}: owner answered $m, asking the gateway")
+            val r = try { legacySessionEdit(id, payload, delete, prof) }
+                catch (x: ApiException) { throw x }
+                catch (x: Exception) { Diag.w("session", "gateway edit failed: ${x.message}"); null }
+            return r ?: throw friendlyMutation(e)
+        }
+    }
+
+    private suspend fun plainEdit(id: String, payload: JsonObject?, isDelete: Boolean, prof: String?): JsonElement {
+        val path = "/api/sessions/${enc(id)}" + (prof?.let { "?profile=" + enc(it) } ?: "")
+        return if (isDelete) delete(path) else patch(path, payload)
+    }
+
+    private fun friendlyMutation(e: ApiException): ApiException {
+        val m = e.message.orEmpty()
+        return when {
+            m.contains("revision_conflict") || m.contains("stale_generation") ->
+                ApiException(e.code, "This chat changed on another device. Refresh and try again.")
+            m.contains("session_busy") -> ApiException(e.code, "Hermes is still working on this chat. Try again in a moment.")
+            m.contains("client_upgrade_required") || m.contains("mutation_identity_required") ->
+                ApiException(e.code, "This server needs a newer Talaria for chat edits. Update the app.")
+            else -> e
+        }
+    }
+
+    /**
+     * The unfenced paths Hermes still serves for rows REST can't mount: `session.delete` for a delete,
+     * and the gateway's session.archive / set_hidden / title RPCs for the sidebar flags.
+     */
+    private suspend fun legacySessionEdit(id: String, payload: JsonObject?, delete: Boolean, prof: String?): JsonElement? {
+        val rpc = rpcFallback ?: return null
+        fun params(extra: JsonObjectBuilder.() -> Unit = {}): JsonObject = buildJsonObject {
+            put("session_id", id)
+            prof?.let { put("profile", it) }
+            extra()
+        }
+        if (!delete) {
+            val p = payload ?: return null
+            var last: JsonElement? = null
+            for ((k, v) in p) {
+                last = when (k) {
+                    "archived" -> rpc("session.archive", params { put("archived", v) })
+                    "hidden" -> rpc("session.set_hidden", params { put("hidden", v) })
+                    "title" -> rpc("session.title", params { put("title", v) })
+                    else -> return null
+                }
+            }
+            return last
+        }
+        val del = params()
+        try {
+            return rpc("session.delete", del)
+        } catch (e: Exception) {
+            if (!e.message.orEmpty().contains("active session")) legacyRefusal(e)
+        }
+        // The gateway still holds the chat live: a detached runtime waiting out its grace period, or the
+        // chat this phone has open. Close idle runtimes only, then delete; never cut a running turn.
+        val live = runCatching {
+            val arr = rpc("session.active_list", JsonObject(emptyMap()))["sessions"] as? JsonArray ?: JsonArray(emptyList())
+            arr.mapNotNull { it as? JsonObject }
+        }.getOrDefault(emptyList()).filter { it["session_key"]?.jsonPrimitive?.contentOrNull == id }
+        if (live.isEmpty()) throw ApiException(409, "Hermes is still running this chat. Stop it, then delete.")
+        if (live.any { it["status"]?.jsonPrimitive?.contentOrNull != "idle" })
+            throw ApiException(409, "Hermes is still running this chat. Stop it, then delete.")
+        runCatching { onLiveClose?.invoke(id) }
+        for (row in live) {
+            val sid = row["id"]?.jsonPrimitive?.contentOrNull ?: continue
+            runCatching { rpc("session.close", buildJsonObject { put("session_id", sid) }) }
+        }
+        repeat(2) { attempt ->
+            try { return rpc("session.delete", del) }
+            catch (e: Exception) {
+                // the closed runtime may still be flushing its last rows; one beat, then one more try
+                if (e.message.orEmpty().contains("active session") && attempt == 0) { delay(400); return@repeat }
+                legacyRefusal(e)
+            }
+        }
+        throw ApiException(409, "Hermes is still running this chat. Stop it, then delete.")
+    }
+
+    private fun legacyRefusal(e: Exception): Nothing {
+        val m = e.message.orEmpty()
+        throw when {
+            m.contains("active session") -> ApiException(409, "Hermes is still running this chat. Stop it, then delete.")
+            m.contains("not found") -> ApiException(404, "Hermes can't find this chat anymore.")
+            else -> ApiException(409, "Couldn't delete: " + m.ifBlank { "the gateway refused" })
+        }
+    }
 
     /** A token for any saved server (one live socket each); the active server goes through the normal path. */
     suspend fun accessTokenFor(server: String): String {

@@ -167,11 +167,11 @@ fun SessionDetailScreen(nav: NavHostController, id: String) {
         var t by remember { mutableStateOf(m?.s("title") ?: "") }
         FormSheet("Rename session", { rename = false }, onConfirm = {
             rename = false
-            scope.act("Renamed", after = { meta.reload() }) { app.api.patch("/api/sessions/${Api.enc(id)}", jsonOf("title" to t.ifBlank { null })) }
+            scope.act("Renamed", after = { meta.reload() }) { app.api.mutateSession(id, jsonOf("title" to t.ifBlank { null })) }
         }) { Field("Title", t, { t = it }) }
     }
     if (del) ConfirmDialog("Delete session?", "This removes the session and its whole message history.", "Delete", danger = true, { del = false }) {
-        scope.act("Deleted", after = { nav.popBackStack() }) { app.api.delete("/api/sessions/${Api.enc(id)}") }
+        scope.act("Deleted", after = { nav.popBackStack() }) { app.api.mutateSession(id, null, delete = true) }
     }
 }
 

@@ -220,7 +220,7 @@ fun SessionRow(s: JsonObject, onChanged: (() -> Unit)? = null, onClick: () -> Un
     val pinned = s.b("pinned"); val archived = s.b("archived"); val hidden = s.b("hidden")
     var menu by remember { mutableStateOf(false) }
     // long-press: pin, archive or hide, the same switches Hermes Desktop has (PATCH /api/sessions/{id})
-    fun set(field: String, v: Boolean, done: String) { menu = false; scope.act(done, after = { onChanged?.invoke() }) { app.api.patch("/api/sessions/${Api.enc(id)}", jsonOf(field to v)) } }
+    fun set(field: String, v: Boolean, done: String) { menu = false; scope.act(done, after = { onChanged?.invoke() }) { app.api.mutateSession(id, jsonOf(field to v), profile = profile) } }
     Box(Modifier.combinedClickable(onClick = onClick, onLongClick = { if (onChanged != null) menu = true })) {
         ListRow(
             title = title,

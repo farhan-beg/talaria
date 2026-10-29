@@ -63,6 +63,8 @@ class HermesApp : Application() {
         store = Store(this)
         dev.hark.hermes.data.Diag.init(this, store.verboseLog.value)
         api = Api(store)
+        api.rpcFallback = { m, params -> gateway.rpc(m, params) }
+        api.onLiveClose = { id -> if (gateway.storedSid == id) gateway.newChat() }
         auth = NativeAuth(api, store)
         TurnService.ensureChannels(this)
         _active = MutableStateFlow(gatewayFor(store.activeId.value))
